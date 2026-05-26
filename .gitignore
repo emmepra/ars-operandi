@@ -1,0 +1,11 @@
+# BEGIN Ora et Labora artifact policy
+# Visibility profile: public
+# Public repos must not publish agent-private operational state by default.
+.project/
+AGENTS.local.md
+.project.local/
+
+# Raw browser artifacts are local evidence, not public source material.
+playwright-report/
+test-results/
+# END Ora et Labora artifact policy

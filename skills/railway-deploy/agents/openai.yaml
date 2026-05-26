@@ -1,0 +1,6 @@
+interface:
+  display_name: "Railway Deploy"
+  short_description: "Deploy and verify Railway services safely"
+  default_prompt: "Use $railway-deploy to deploy this app on Railway with preflight checks, credential handling, smoke verification, and rollback notes."
+policy:
+  allow_implicit_invocation: true
