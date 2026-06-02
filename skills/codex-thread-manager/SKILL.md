@@ -1,6 +1,6 @@
 ---
 name: codex-thread-manager
-description: Create, name, verify, and coordinate user-facing Codex app threads for projects. Use when the user asks to create/open/start/rename/organize Codex threads, spin up a project/workstream thread, define thread slugs or project mapping, or coordinate work across Codex app threads without using subagents or codex exec.
+description: Use when the user asks to create, open, start, rename, organize, or coordinate user-facing Codex app threads for a project, issue, workstream, or project/thread slug mapping.
 ---
 
 # Codex Thread Manager
@@ -55,11 +55,9 @@ Thread title inside it: <issue_id?>-<workstream_slug>
 Examples:
 
 ```text
-personal-workflow-agent / CER-93-whatsapp-context
-personal-workflow-agent / google-cli-spike
-personal-ed-lab / deepfake-trust
-icaro-alibaba-3pe / nda-follow-up
-personal-capture / CER-69-fondirigenti-ai-challenge
+<area>-<project_slug> / <issue_id>-<workstream_slug>
+<area>-<project_slug> / <workstream_slug>
+<area>-capture / <issue_id>-<capture_slug>
 ```
 
 Do not include `CoS` in visible thread titles. Coordinator state belongs in the prompt or status summary, not the thread identity.
@@ -69,7 +67,7 @@ Slug rules:
 - Prefer existing repo/project names: `workflow-agent`, `ed-lab`, `alibaba-3pe`.
 - Lowercase, ASCII, hyphen-separated.
 - Keep slugs short enough to scan in the thread list.
-- Put issue identifiers at the start of the thread title when useful: `CER-93-whatsapp-context`.
+- Put issue identifiers at the start of the thread title when useful: `<issue_id>-<workstream_slug>`.
 - If the Codex app surface does not expose a separate project/container field, encode both parts in the visible title as `<area>-<project_slug> - <issue_id?>-<workstream_slug>`.
 - Do not create a new project slug if an obvious repo, Linear project, or vault project already exists.
 - Use `capture` for a single action, rough idea, or item that does not yet deserve durable project memory.
@@ -122,8 +120,8 @@ Example fallback command:
 
 ```bash
 node skills/codex-thread-manager/scripts/create_app_thread.mjs \
-  --cwd /Users/emmepra/repos/cerebro/personal/workflow-agent \
-  --title "personal-workflow-agent - CER-93-whatsapp-context" \
+  --cwd <project-root-or-worktree> \
+  --title "<area>-<project_slug> - <issue_id>-<workstream_slug>" \
   --prompt-file /tmp/thread-prompt.md \
   --effort xhigh \
   --sandbox workspace-write \
