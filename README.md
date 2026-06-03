@@ -1,6 +1,6 @@
 # Ars Operandi
 
-Ars Operandi is a public Codex skill pack for operational adapters: deployment platforms, hosting providers, DNS, edge services, VPS runtimes, and other third-party infrastructure.
+Ars Operandi is a public Codex skill pack for operational adapters: deployment platforms, hosting providers, DNS, edge services, VPS runtimes, Codex app thread management, and other external operating surfaces.
 
 It complements Ora et Labora. Ora et Labora defines the repo-first workflow: issues, branches, worktrees, PRs, verification, releases, and rollback discipline. Ars Operandi defines provider-specific operating procedures that an agent should use inside that workflow.
 
@@ -8,6 +8,7 @@ It complements Ora et Labora. Ora et Labora defines the repo-first workflow: iss
 
 | Skill | Use for |
 | --- | --- |
+| `codex-thread-manager` | User-facing Codex app thread creation, naming, verification, and project/workstream coordination |
 | `railway-deploy` | Railway deployment, release, variables, services, Postgres links, domains, smoke checks, and rollback notes |
 
 Future adapters may cover Cloudflare, Hetzner, Docker Compose VPS, Tailscale, Resend, and other operational surfaces.
@@ -18,6 +19,7 @@ Copy or install the relevant skill folder into your Codex skills directory, or k
 
 ```bash
 cp -R skills/railway-deploy ~/.codex/skills/
+cp -R skills/codex-thread-manager ~/.codex/skills/
 ```
 
 Invoke explicitly when needed:

@@ -4,15 +4,16 @@ Scope: applies to this repository.
 
 ## Purpose
 
-Ars Operandi is a public skill pack for provider-specific operational adapters. Keep it focused on third-party runtime surfaces such as Railway, Cloudflare, Hetzner, Docker Compose VPS, Tailscale, DNS, storage, email, and related deployment or operations workflows.
+Ars Operandi is a public skill pack for operational adapters. Keep it focused on external operating surfaces that agents need to use reliably, such as Railway, Cloudflare, Hetzner, Docker Compose VPS, Tailscale, DNS, storage, email, Codex app thread management, and related deployment or operations workflows.
 
 Ora et Labora remains the workflow layer. Ars Operandi is the provider-adapter layer.
 
 ## Routing
 
 - Use `railway-deploy` for Railway deploys, service links, variables, domains, public smoke checks, and rollback notes.
+- Use `codex-thread-manager` for user-facing Codex app thread creation, naming, verification, and project/workstream thread coordination.
 - Use Ora et Labora workflow skills for issue shaping, branch/worktree handling, verification, PRs, releases, and state discipline.
-- Add new provider skills only when the provider has recurring commands, auth boundaries, failure modes, or verification steps that are worth reusing.
+- Add new operational adapter skills only when the surface has recurring commands, auth boundaries, failure modes, naming rules, or verification steps that are worth reusing.
 
 ## Public Repo Policy
 
