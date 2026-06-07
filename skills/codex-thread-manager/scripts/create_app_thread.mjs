@@ -91,9 +91,38 @@ const stderr = [];
 let threadId = null;
 let completed = false;
 let verified = false;
+let visible = false;
 let finalText = "";
 let commandCount = 0;
 let fileChangeCount = 0;
+let matchedThread = null;
+let verificationError = "not_checked";
+
+const nonUserVisibleSources = new Set(["cli", "vscode", "appServer"]);
+
+function verifyThreadList(result) {
+  const threads = Array.isArray(result?.data) ? result.data : [];
+  matchedThread = threads.find((thread) => thread.id === threadId && thread.name === args.title) ?? null;
+
+  if (!matchedThread) {
+    verificationError = "thread_not_found_after_creation";
+    return false;
+  }
+
+  const source = matchedThread.source ?? null;
+  if (!source) {
+    verificationError = "thread_found_without_source";
+    return false;
+  }
+
+  if (nonUserVisibleSources.has(source)) {
+    verificationError = `thread_created_in_non_user_visible_source:${source}`;
+    return false;
+  }
+
+  verificationError = null;
+  return true;
+}
 
 function send(message) {
   proc.stdin.write(`${JSON.stringify(message)}\n`);
@@ -106,7 +135,11 @@ function finish(code) {
     title: args.title,
     cwd: args.cwd,
     completed,
+    created: Boolean(threadId),
     verified,
+    visible,
+    source: matchedThread?.source ?? null,
+    verificationError,
     commandCount,
     fileChangeCount,
     finalText: finalText.trim(),
@@ -184,6 +217,8 @@ rl.on("line", (line) => {
       id: 4,
       params: {
         limit: 10,
+        // App Server-created sessions currently show up under these non-Desktop sources.
+        // Finding one here is diagnostic evidence, not user-visible app-thread success.
         sourceKinds: ["cli", "vscode", "appServer"],
         archived: false,
         searchTerm: args.title,
@@ -193,8 +228,14 @@ rl.on("line", (line) => {
   }
 
   if (message.id === 4) {
-    verified = Array.isArray(message.result?.data)
-      && message.result.data.some((thread) => thread.id === threadId && thread.name === args.title);
+    if (message.error) {
+      verificationError = `thread_list_error:${message.error.message ?? "unknown"}`;
+      finish(3);
+      return;
+    }
+
+    visible = verifyThreadList(message.result);
+    verified = visible;
     finish(verified ? 0 : 3);
   }
 });

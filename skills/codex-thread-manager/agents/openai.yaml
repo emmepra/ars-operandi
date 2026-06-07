@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Thread Manager"
-  short_description: "Create app threads with project-aware naming"
-  default_prompt: "Use $codex-thread-manager to create a Codex app thread for this project with a clear slug, verified title, and explicit xhigh reasoning effort."
+  short_description: "Create visible app threads with project-aware naming"
+  default_prompt: "Use $codex-thread-manager to create a visible Codex app thread for this project with a clear slug, verified title, and explicit xhigh reasoning effort."
