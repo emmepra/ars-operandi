@@ -13,10 +13,12 @@ Use this skill to create real Codex app threads that the user can see in the Cod
 - Do not use `codex exec` for app threads. Use it only for explicit non-interactive report runs, and say it will not appear as a normal app thread.
 - Do not use unverified deep links as a creation fallback.
 - Prefer native app thread tools when available: `create_thread`, `list_threads`, `read_thread`, `send_message_to_thread`, `set_thread_title`.
-- If native thread tools are unavailable, use the official App Server protocol through `codex app-server --listen stdio://` or the bundled fallback script.
-- Verify creation with `thread/list` before telling the user a thread exists.
+- Native app thread tools are required for a user-visible Codex Desktop thread. If those tools are unavailable, say the tool surface cannot create a visible app thread in this session.
+- The App Server protocol and bundled fallback script are diagnostic fallbacks only. They must not be treated as successful user-facing thread creation unless they verify a Desktop-visible source.
+- Treat `cli`, `vscode`, and `appServer` thread sources as non-user-visible for Codex Desktop purposes.
+- Verify creation before telling the user a thread exists.
 - Keep the current/default model unless the user asks for a model override.
-- Default reasoning effort is `xhigh` for user-requested project threads.
+- Always request extra-high reasoning for user-requested project threads: with native `create_thread` / `send_message_to_thread`, pass `thinking: "xhigh"` explicitly; with the fallback script, pass `--effort xhigh` or rely on its `xhigh` default.
 
 ## Coordination Model
 
@@ -64,7 +66,7 @@ Do not include `CoS` in visible thread titles. Coordinator state belongs in the 
 
 Slug rules:
 
-- Prefer existing repo, project, or registry names.
+- Prefer existing repo, project, or registry names, normalized as short lowercase slugs.
 - Lowercase, ASCII, hyphen-separated.
 - Keep slugs short enough to scan in the thread list.
 - Put issue identifiers at the start of the thread title when useful: `<issue_id>-<workstream_slug>`.
@@ -102,6 +104,18 @@ A project thread prompt should include:
 - verification expectations
 - final status format
 
+Native tool calls must include `thinking: "xhigh"` for user-requested project threads unless the user explicitly asks for a lower effort. Do not rely on the app default for reasoning effort.
+
+Example native creation shape:
+
+```json
+{
+  "target": {"type": "project", "projectId": "/path/to/workspace", "environment": {"type": "local"}},
+  "thinking": "xhigh",
+  "prompt": "..."
+}
+```
+
 When a child thread should retrieve context itself, include a focused instruction such as:
 
 ```text
@@ -119,9 +133,10 @@ For read-only research/review threads, set read-only intent clearly and tell the
 ## Creation Workflow
 
 1. Prefer native app thread tools if the tool surface exposes them.
-2. If not exposed, run `scripts/create_app_thread.mjs` from this skill.
-3. Wait until the script reports a verified thread id.
-4. Report the thread title, id, cwd, and whether the turn completed or is still running.
+2. If native tools are not exposed, do not create a subagent, `codex exec` run, CLI session, or App Server session as a substitute for a visible app thread.
+3. Use `scripts/create_app_thread.mjs` only when a diagnostic fallback is explicitly useful, then require `verified: true` and `visible: true`.
+4. If the fallback returns `verified: false`, `visible: false`, or a non-user-visible `source`, report that no visible Codex app thread was created. Include the attempted title, cwd, and verification error.
+5. Report the thread title, id, cwd, and whether the turn completed or is still running only after user-visible verification succeeds.
 
 Example fallback command:
 
@@ -142,10 +157,10 @@ Use `--sandbox read-only` for pure planning/review. Use `--approval on-request` 
 Treat a thread as created only after at least one of these succeeds:
 
 - native thread tool returns a thread id and a later list/read confirms the title
-- fallback script prints `verified: true`
-- App Server `thread/list` finds the same id and title
+- fallback script prints both `verified: true` and `visible: true`
+- App Server `thread/list` finds the same id and title with a source that is not `cli`, `vscode`, or `appServer`
 
-If verification fails, say so and do not claim the thread is visible.
+If verification fails, say so and do not claim the thread is visible. If a fallback created a non-visible session, call it an App Server diagnostic session, not a Codex app thread.
 
 ## Updating The Procedure
 
