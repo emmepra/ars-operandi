@@ -16,7 +16,7 @@ Use this skill to create real Codex app threads that the user can see in the Cod
 - If native thread tools are unavailable, use the official App Server protocol through `codex app-server --listen stdio://` or the bundled fallback script.
 - Verify creation with `thread/list` before telling the user a thread exists.
 - Keep the current/default model unless the user asks for a model override.
-- Default reasoning effort is `xhigh` for user-requested project threads.
+- Always request extra-high reasoning for user-requested project threads: with native `create_thread` / `send_message_to_thread`, pass `thinking: "xhigh"` explicitly; with the fallback script, pass `--effort xhigh` or rely on its `xhigh` default.
 
 ## Coordination Model
 
@@ -94,6 +94,18 @@ A project thread prompt should include:
 - allowed and forbidden actions
 - verification expectations
 - final status format
+
+Native tool calls must include `thinking: "xhigh"` for user-requested project threads unless the user explicitly asks for a lower effort. Do not rely on the app default for reasoning effort.
+
+Example native creation shape:
+
+```json
+{
+  "target": {"type": "project", "projectId": "/path/to/workspace", "environment": {"type": "local"}},
+  "thinking": "xhigh",
+  "prompt": "..."
+}
+```
 
 When a child thread should retrieve context itself, include a focused instruction such as:
 
