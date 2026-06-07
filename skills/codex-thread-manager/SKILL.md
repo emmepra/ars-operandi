@@ -39,10 +39,10 @@ area -> project -> workstream -> execution surface
 
 Definitions:
 
-- `area`: routing bucket such as `personal`, `research`, or `icaro`.
-- `project_slug`: durable context bucket such as `agent-runtime`, `research-notes`, `client-review`, or temporary `capture`.
+- `area`: routing bucket for a workspace area.
+- `project_slug`: durable context bucket for a project or temporary capture lane.
 - `codex_project`: visible Codex app project/container name, formatted as `<area>-<project_slug>`.
-- `workstream_slug`: active work slice inside the project, such as `message-context`, `cli-spike`, or `contract-review`.
+- `workstream_slug`: active work slice inside the project.
 - `execution surface`: Codex thread, Linear issue, git branch/worktree, vault note, PR, or deployment.
 
 Closest project `AGENTS.md` files may override the visible thread title format when the Codex project/container already supplies the project identity. Follow those local overrides after resolving the target project.
@@ -57,16 +57,16 @@ Thread title inside it: <issue_id?>-<workstream_slug>
 Examples:
 
 ```text
-<area>-<project_slug> / <issue_id>-<workstream_slug>
-<area>-<project_slug> / <workstream_slug>
-<area>-capture / <issue_id>-<capture_slug>
+<area>-<project-slug> / <issue-id>-<workstream-slug>
+<area>-<project-slug> / <workstream-slug>
+<area>-<capture-slug> / <issue-id>-<workstream-slug>
 ```
 
 Do not include `CoS` in visible thread titles. Coordinator state belongs in the prompt or status summary, not the thread identity.
 
 Slug rules:
 
-- Prefer existing repo/project names, normalized as short lowercase slugs.
+- Prefer existing repo, project, or registry names, normalized as short lowercase slugs.
 - Lowercase, ASCII, hyphen-separated.
 - Keep slugs short enough to scan in the thread list.
 - Put issue identifiers at the start of the thread title when useful: `<issue_id>-<workstream_slug>`.
@@ -74,6 +74,13 @@ Slug rules:
 - Do not create a new project slug if an obvious repo, Linear project, or vault project already exists.
 - Use `capture` for a single action, rough idea, or item that does not yet deserve durable project memory.
 - Promote from `capture/<workstream>` to a dedicated `project_slug` only when the work gains recurring context, multiple issues/threads, source materials, decisions, or ownership.
+
+## Issue And Repo Coordination
+
+- For issue-linked threads, ensure the issue identifier is present in both the thread title and the initial prompt.
+- Do not write the Codex thread id back to the issue by default. Do that only when the user explicitly asks for issue-visible thread provenance.
+- For repo-scoped threads, include a prompt instruction to read the relevant `AGENTS.md` files and evaluate whether the repo's workflow layer applies.
+- When a repo uses Ora et Labora or a comparable local workflow, tell the child thread to use the minimal relevant subset; do not force the full lifecycle for small documentation, policy, or context-only edits.
 
 ## Project Resolution
 
