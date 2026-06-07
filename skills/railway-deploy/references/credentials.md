@@ -20,8 +20,11 @@ For interactive Codex work, prefer persistent Railway CLI auth per execution hos
 - Mac Codex uses the Mac user's Railway CLI login state.
 - Pi Codex uses the Pi user's Railway CLI login state.
 - Log in once per host with `railway login` or `railway login --browserless`.
+- Railway CLI stores the persistent session under `~/.railway/`, commonly `~/.railway/config.json`; use that as the credential reference, not as content to inspect or copy.
 - Keep the Railway config directory private to the user, for example `chmod -R go-rwx ~/.railway`.
 - Do not put Railway tokens in `SKILL.md`, `~/.codex/config.toml`, repo files, `.env`, or memory notes.
+- Before asking for a new login, run `railway whoami` from any directory. If the repo is linked, follow with `railway status --json` from the repo root.
+- If auth is stale (`invalid_grant`, `Unauthorized`, or mutation-only failures), update the CLI if needed, then run `railway login --browserless` once and retry.
 
 This gives the desired "login once and reuse it" behavior without making the credential portable across unrelated agents or repositories. If the host is rebuilt, log in again. If the host is lost or compromised, revoke the Railway session/token from Railway.
 
@@ -46,6 +49,8 @@ Local interactive work:
 railway login
 railway login --browserless
 chmod -R go-rwx ~/.railway
+chmod 600 ~/.railway/config.json
+railway whoami
 railway status
 ```
 

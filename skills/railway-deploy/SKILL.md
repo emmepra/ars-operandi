@@ -13,7 +13,16 @@ Core principle: do not confuse a merge, a Railway deployment, and a public smoke
 
 Credentials never belong in this skill, in chat, in commit history, or in logs.
 
-Before touching secrets, read `references/credentials.md`. In short:
+The Railway CLI auth for interactive Codex work should be global for the OS user on that host, not project-local. Treat `~/.railway/config.json` as the persistent CLI credential reference; do not print, copy, commit, or summarize its contents.
+
+Before asking the user to re-authenticate:
+
+- run `railway whoami` from any directory to check the global CLI session
+- if the target repo is already linked, run `railway status --json` from the repo root to confirm project/service/environment
+- if the CLI reports `invalid_grant` or `Unauthorized`, upgrade the CLI if it is stale, then run `railway login --browserless` once and ask the user to complete the activation code
+- keep `~/.railway/` private and `~/.railway/config.json` at mode `600`
+
+Before touching deployed secrets, read `references/credentials.md`. In short:
 
 - use persistent Railway CLI auth for the OS user running Codex; log in once per host with `railway login` / `railway login --browserless`
 - use Railway Variables for deployed app secrets
