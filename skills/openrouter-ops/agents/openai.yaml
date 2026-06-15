@@ -1,0 +1,6 @@
+interface:
+  display_name: "OpenRouter Ops"
+  short_description: "Run with ephemeral OpenRouter keys"
+  default_prompt: "Use $openrouter-ops to create a workspace-scoped ephemeral OpenRouter key, run a command, and delete the key without exposing secrets."
+policy:
+  allow_implicit_invocation: true
