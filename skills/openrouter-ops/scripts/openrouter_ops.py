@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safe OpenRouter provider operations with 1Password handoff."""
+"""Safe OpenRouter provider operations with ephemeral runtime keys."""
 
 from __future__ import annotations
 
@@ -39,9 +39,9 @@ class OpenRouterError(CliError):
     pass
 
 
-def print_json(data: Any) -> None:
-    json.dump(data, sys.stdout, indent=2, sort_keys=True)
-    sys.stdout.write("\n")
+def print_json(data: Any, *, stream: Any = sys.stdout) -> None:
+    json.dump(data, stream, indent=2, sort_keys=True)
+    stream.write("\n")
 
 
 def redact(value: Any) -> Any:
@@ -71,11 +71,12 @@ def redact(value: Any) -> Any:
     return value
 
 
-def ensure_op_available() -> str:
-    op_path = shutil.which("op")
-    if not op_path:
-        raise CliError("1Password CLI 'op' was not found on PATH")
-    return op_path
+def redact_text(value: str, *extra_secrets: str) -> str:
+    redacted = OPENROUTER_KEY_RE.sub("<redacted-openrouter-key>", value)
+    for secret in extra_secrets:
+        if secret:
+            redacted = redacted.replace(secret, "<redacted-openrouter-key>")
+    return redacted
 
 
 def secret_from_env(env_name: str, purpose: str) -> str:
@@ -214,125 +215,6 @@ def build_create_payload(args: argparse.Namespace, workspace_id: str | None) -> 
     return payload
 
 
-def metadata_notes(metadata: dict[str, Any]) -> str:
-    lines = [
-        "OpenRouter runtime API key.",
-        "Metadata below is non-secret and was captured when the key was stored.",
-        "",
-    ]
-    for key in sorted(metadata):
-        value = metadata[key]
-        if value is None:
-            continue
-        lines.append(f"{key}: {value}")
-    return "\n".join(lines)
-
-
-def date_field_from_iso(value: str | None) -> str:
-    if not value:
-        return ""
-    try:
-        normalized = normalize_utc_timestamp(value)
-        return normalized[:10]
-    except Exception:
-        return ""
-
-
-def build_api_credential_item(
-    *,
-    title: str,
-    credential: str,
-    username: str,
-    expires_at: str | None,
-    metadata: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "title": title,
-        "category": "API_CREDENTIAL",
-        "fields": [
-            {
-                "id": "notesPlain",
-                "type": "STRING",
-                "purpose": "NOTES",
-                "label": "notesPlain",
-                "value": metadata_notes(metadata),
-            },
-            {"id": "username", "type": "STRING", "label": "username", "value": username},
-            {"id": "credential", "type": "CONCEALED", "label": "credential", "value": credential},
-            {"id": "type", "type": "MENU", "label": "type", "value": "OpenRouter API key"},
-            {"id": "filename", "type": "STRING", "label": "filename", "value": ""},
-            {"id": "validFrom", "type": "DATE", "label": "valid from", "value": utc_now().date().isoformat()},
-            {"id": "expires", "type": "DATE", "label": "expires", "value": date_field_from_iso(expires_at)},
-            {"id": "hostname", "type": "STRING", "label": "hostname", "value": "openrouter.ai"},
-        ],
-    }
-
-
-def run_op_item_create(
-    item_template: dict[str, Any],
-    *,
-    vault: str,
-    tags: list[str],
-    account: str | None = None,
-    dry_run: bool = False,
-) -> dict[str, Any]:
-    ensure_op_available()
-    cmd = ["op", "item", "create", "--vault", vault, "--format", "json"]
-    if account:
-        cmd.extend(["--account", account])
-    if tags:
-        cmd.extend(["--tags", ",".join(tags)])
-    if dry_run:
-        cmd.append("--dry-run")
-    cmd.append("-")
-
-    proc = subprocess.run(
-        cmd,
-        input=json.dumps(item_template),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise CliError(
-            "1Password item create failed",
-            {
-                "returncode": proc.returncode,
-                "stderr": redact(proc.stderr.strip()),
-            },
-        )
-    if not proc.stdout.strip():
-        return {"created": not dry_run}
-    try:
-        return json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return {"created": not dry_run, "stdout": redact(proc.stdout.strip())}
-
-
-def preflight_store(args: argparse.Namespace) -> None:
-    fake_template = build_api_credential_item(
-        title=args.op_item,
-        credential="OPENROUTER_RUNTIME_KEY_REDACTED",
-        username=args.name,
-        expires_at=expires_from_args(args),
-        metadata={"dry_run": True, "source": "openrouter-ops-preflight"},
-    )
-    run_op_item_create(
-        fake_template,
-        vault=args.op_vault,
-        tags=parse_tags(args.op_tags),
-        account=args.op_account,
-        dry_run=True,
-    )
-
-
-def parse_tags(raw: str | None) -> list[str]:
-    if not raw:
-        return []
-    return [tag.strip() for tag in raw.split(",") if tag.strip()]
-
-
 def extract_created_key(response: dict[str, Any]) -> str:
     key = response.get("key")
     if isinstance(key, str) and key:
@@ -362,6 +244,67 @@ def created_key_metadata(response: dict[str, Any], workspace_resolution: dict[st
         metadata["workspace_input"] = workspace_resolution.get("input")
         metadata["workspace_resolved_by"] = workspace_resolution.get("resolved_by")
     return metadata
+
+
+def target_command_from_args(args: argparse.Namespace) -> list[str]:
+    target_command = list(args.target_command)
+    if target_command[:1] == ["--"]:
+        target_command = target_command[1:]
+    if not target_command:
+        raise CliError(f"{args.command} requires a command after --")
+    return target_command
+
+
+def build_child_env(
+    base_env: dict[str, str],
+    *,
+    runtime_key: str,
+    runtime_env_name: str,
+    management_env_name: str,
+) -> dict[str, str]:
+    child_env = dict(base_env)
+    child_env.pop(management_env_name, None)
+    child_env[runtime_env_name] = runtime_key
+    return child_env
+
+
+def delete_runtime_key(
+    *,
+    token: str,
+    key_hash: str | None,
+    api_base: str,
+    timeout: float,
+) -> dict[str, Any]:
+    if not key_hash:
+        return {"attempted": False, "deleted": False, "reason": "missing-key-hash"}
+    try:
+        response = api_request(
+            "DELETE",
+            f"/keys/{urllib.parse.quote(str(key_hash), safe='')}",
+            token,
+            api_base=api_base,
+            body={},
+            timeout=timeout,
+        )
+        return {"attempted": True, "deleted": True, "response": redact(response)}
+    except CliError as exc:
+        return {
+            "attempted": True,
+            "deleted": False,
+            "error": str(exc),
+            "details": redact(getattr(exc, "details", {})),
+        }
+
+
+def emit_child_output(proc: subprocess.CompletedProcess[str], runtime_key: str) -> None:
+    if proc.stdout:
+        sys.stdout.write(redact_text(proc.stdout, runtime_key))
+        if not proc.stdout.endswith("\n"):
+            sys.stdout.write("\n")
+    if proc.stderr:
+        sys.stderr.write(redact_text(proc.stderr, runtime_key))
+        if not proc.stderr.endswith("\n"):
+            sys.stderr.write("\n")
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
@@ -445,6 +388,35 @@ def cmd_credits(args: argparse.Namespace) -> int:
 
 
 def cmd_create_key(args: argparse.Namespace) -> int:
+    if args.live:
+        raise CliError(
+            "Standalone create-key no longer creates runtime keys. Use run-ephemeral --live -- <command> "
+            "so the key is injected and then deleted."
+        )
+    workspace_id, workspace_resolution = resolve_workspace_id(
+        args.workspace,
+        "",
+        api_base=args.api_base,
+        timeout=args.timeout,
+        dry_run=True,
+    )
+    payload = build_create_payload(args, workspace_id)
+
+    print_json(
+        {
+            "ok": True,
+            "live": False,
+            "operation": "create-key",
+            "request": {"method": "POST", "path": "/keys", "body": payload},
+            "workspace_resolution": workspace_resolution,
+            "next_step": "Use run-ephemeral --live under op run to create, inject, and delete a runtime key.",
+        }
+    )
+    return 0
+
+
+def cmd_run_ephemeral(args: argparse.Namespace) -> int:
+    target_command = target_command_from_args(args)
     dry_run = not args.live
     token = "" if dry_run else secret_from_env(args.management_env, "OpenRouter management key")
     workspace_id, workspace_resolution = resolve_workspace_id(
@@ -461,137 +433,68 @@ def cmd_create_key(args: argparse.Namespace) -> int:
             {
                 "ok": True,
                 "live": False,
-                "operation": "create-key",
+                "operation": "run-ephemeral",
                 "request": {"method": "POST", "path": "/keys", "body": payload},
                 "workspace_resolution": workspace_resolution,
-                "store_target": {
-                    "vault": args.op_vault,
-                    "item": args.op_item,
-                    "tags": parse_tags(args.op_tags),
-                },
-                "next_step": "Run again with --live under op run after reviewing this payload.",
+                "env_name": args.env_name,
+                "command": target_command,
+                "cleanup": {"on_exit": "delete-key"},
+                "next_step": "Run again with --live under op run to create, inject, and delete a runtime key.",
             }
         )
         return 0
 
-    preflight_store(args)
     response = api_request("POST", "/keys", token, api_base=args.api_base, body=payload, timeout=args.timeout)
     runtime_key = extract_created_key(response)
     metadata = created_key_metadata(response, workspace_resolution)
-    item_template = build_api_credential_item(
-        title=args.op_item,
-        credential=runtime_key,
-        username=metadata.get("label") or args.name,
-        expires_at=metadata.get("expires_at") or payload.get("expires_at"),
-        metadata=metadata,
-    )
-
     key_hash = metadata.get("hash")
+    child_env = build_child_env(
+        os.environ,
+        runtime_key=runtime_key,
+        runtime_env_name=args.env_name,
+        management_env_name=args.management_env,
+    )
+
+    command_returncode = 1
+    cleanup: dict[str, Any] = {"attempted": False, "deleted": False}
     try:
-        op_result = run_op_item_create(
-            item_template,
-            vault=args.op_vault,
-            tags=parse_tags(args.op_tags),
-            account=args.op_account,
-            dry_run=False,
+        try:
+            proc = subprocess.run(
+                target_command,
+                env=child_env,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            command_returncode = proc.returncode
+            emit_child_output(proc, runtime_key)
+        except OSError as exc:
+            command_returncode = 127
+            sys.stderr.write(f"openrouter-ops: failed to start command: {exc}\n")
+    finally:
+        cleanup = delete_runtime_key(
+            token=token,
+            key_hash=str(key_hash) if key_hash else None,
+            api_base=args.api_base,
+            timeout=args.timeout,
         )
-    except CliError as exc:
-        cleanup: dict[str, Any] = {"attempted": False}
-        if key_hash:
-            cleanup["attempted"] = True
-            try:
-                cleanup["response"] = redact(
-                    api_request(
-                        "DELETE",
-                        f"/keys/{urllib.parse.quote(str(key_hash), safe='')}",
-                        token,
-                        api_base=args.api_base,
-                        body={},
-                        timeout=args.timeout,
-                    )
-                )
-                cleanup["deleted"] = True
-            except CliError as cleanup_exc:
-                cleanup["deleted"] = False
-                cleanup["error"] = str(cleanup_exc)
-                cleanup["details"] = getattr(cleanup_exc, "details", {})
-        raise CliError(
-            "OpenRouter key was created but 1Password storage failed; cleanup was attempted without printing the key",
-            {"store_error": str(exc), "store_details": exc.details, "key_hash": key_hash, "cleanup": cleanup},
-        ) from exc
 
-    print_json(
-        {
-            "ok": True,
-            "live": True,
-            "operation": "create-key",
-            "openrouter_key": redact({"data": response.get("data")}),
-            "one_password": {
-                "stored": True,
-                "vault": args.op_vault,
-                "item": args.op_item,
-                "id": op_result.get("id") if isinstance(op_result, dict) else None,
-                "title": op_result.get("title") if isinstance(op_result, dict) else args.op_item,
-            },
-        }
-    )
-    return 0
-
-
-def cmd_store_runtime_key(args: argparse.Namespace) -> int:
-    runtime_key = "" if not args.live else secret_from_env(args.runtime_env, "OpenRouter runtime key")
-    metadata = {
-        "hash": args.hash,
-        "label": args.label,
-        "name": args.label,
-        "workspace_id": args.workspace_id,
-        "limit": args.limit,
-        "limit_reset": args.limit_reset if args.limit_reset != "omit" else None,
-        "expires_at": normalize_utc_timestamp(args.expires_at) if args.expires_at else None,
-        "source": "manual-store-runtime-key",
+    summary = {
+        "ok": command_returncode == 0 and bool(cleanup.get("deleted")),
+        "live": True,
+        "operation": "run-ephemeral",
+        "openrouter_key": redact({"data": response.get("data")}),
+        "env_name": args.env_name,
+        "command_returncode": command_returncode,
+        "cleanup": cleanup,
     }
-    if not args.live:
-        print_json(
-            {
-                "ok": True,
-                "live": False,
-                "operation": "store-runtime-key",
-                "runtime_env": args.runtime_env,
-                "store_target": {"vault": args.op_vault, "item": args.op_item, "tags": parse_tags(args.op_tags)},
-                "metadata": metadata,
-                "next_step": "Set the runtime key as a secret reference in the runtime env and run again with --live under op run.",
-            }
-        )
-        return 0
-
-    item_template = build_api_credential_item(
-        title=args.op_item,
-        credential=runtime_key,
-        username=args.label or args.hash or "openrouter-runtime-key",
-        expires_at=metadata.get("expires_at"),
-        metadata=metadata,
-    )
-    op_result = run_op_item_create(
-        item_template,
-        vault=args.op_vault,
-        tags=parse_tags(args.op_tags),
-        account=args.op_account,
-        dry_run=False,
-    )
-    print_json(
-        {
-            "ok": True,
-            "live": True,
-            "operation": "store-runtime-key",
-            "one_password": {
-                "stored": True,
-                "vault": args.op_vault,
-                "item": args.op_item,
-                "id": op_result.get("id") if isinstance(op_result, dict) else None,
-            },
-        }
-    )
-    return 0
+    print_json(summary, stream=sys.stderr)
+    if command_returncode == 0 and not cleanup.get("deleted"):
+        return 2
+    return command_returncode
 
 
 def patch_key_disabled(args: argparse.Namespace, disabled: bool) -> int:
@@ -653,32 +556,20 @@ def cmd_delete_key(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_run_with_key(args: argparse.Namespace) -> int:
-    ensure_op_available()
-    if not args.key_ref.startswith(SECRET_REF_PREFIX):
-        raise CliError("--key-ref must be a 1Password secret reference starting with op://")
-    target_command = args.target_command
-    if target_command[:1] == ["--"]:
-        target_command = target_command[1:]
-    if not target_command:
-        raise CliError("run-with-key requires a command after --")
-    env = os.environ.copy()
-    env[args.env_name] = args.key_ref
-    cmd = ["op", "run", "--", *target_command]
-    return subprocess.run(cmd, env=env, check=False).returncode
-
-
 def add_common_api_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--api-base", default=API_BASE_DEFAULT)
     parser.add_argument("--timeout", type=float, default=30)
     parser.add_argument("--management-env", default=MANAGEMENT_ENV_DEFAULT)
 
 
-def add_store_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--op-vault", required=True)
-    parser.add_argument("--op-item", required=True)
-    parser.add_argument("--op-tags", default="openrouter,api-key")
-    parser.add_argument("--op-account")
+def add_key_request_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--workspace", help="Workspace UUID or slug")
+    parser.add_argument("--limit", type=float)
+    parser.add_argument("--limit-reset", choices=["daily", "weekly", "monthly", "none", "omit"], default="omit")
+    parser.add_argument("--expires-at")
+    parser.add_argument("--expires-in-days", type=int)
+    parser.add_argument("--include-byok-in-limit", action="store_true")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -718,30 +609,22 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_api_args(credits)
     credits.set_defaults(func=cmd_credits)
 
-    create_key = subparsers.add_parser("create-key", help="Create and immediately store an OpenRouter runtime key")
+    create_key = subparsers.add_parser("create-key", help="Dry-run an OpenRouter runtime key payload")
     add_common_api_args(create_key)
-    add_store_args(create_key)
-    create_key.add_argument("--live", action="store_true", help="Perform the OpenRouter and 1Password mutations")
-    create_key.add_argument("--name", required=True)
-    create_key.add_argument("--workspace", help="Workspace UUID or slug")
-    create_key.add_argument("--limit", type=float)
-    create_key.add_argument("--limit-reset", choices=["daily", "weekly", "monthly", "none", "omit"], default="omit")
-    create_key.add_argument("--expires-at")
-    create_key.add_argument("--expires-in-days", type=int)
-    create_key.add_argument("--include-byok-in-limit", action="store_true")
+    create_key.add_argument("--live", action="store_true", help="Rejected: use run-ephemeral --live instead")
+    add_key_request_args(create_key)
     create_key.set_defaults(func=cmd_create_key)
 
-    store_runtime = subparsers.add_parser("store-runtime-key", help="Store an existing runtime key from env in 1Password")
-    add_store_args(store_runtime)
-    store_runtime.add_argument("--live", action="store_true")
-    store_runtime.add_argument("--runtime-env", default=RUNTIME_ENV_DEFAULT)
-    store_runtime.add_argument("--hash")
-    store_runtime.add_argument("--label")
-    store_runtime.add_argument("--workspace-id")
-    store_runtime.add_argument("--limit", type=float)
-    store_runtime.add_argument("--limit-reset", choices=["daily", "weekly", "monthly", "none", "omit"], default="omit")
-    store_runtime.add_argument("--expires-at")
-    store_runtime.set_defaults(func=cmd_store_runtime_key)
+    run_ephemeral = subparsers.add_parser(
+        "run-ephemeral",
+        help="Create a runtime key, inject it into a command, then delete it",
+    )
+    add_common_api_args(run_ephemeral)
+    run_ephemeral.add_argument("--live", action="store_true", help="Perform the OpenRouter mutation and run the command")
+    add_key_request_args(run_ephemeral)
+    run_ephemeral.add_argument("--env-name", default=RUNTIME_ENV_DEFAULT)
+    run_ephemeral.add_argument("target_command", nargs=argparse.REMAINDER)
+    run_ephemeral.set_defaults(func=cmd_run_ephemeral)
 
     disable_key = subparsers.add_parser("disable-key", help="Disable an OpenRouter API key by hash")
     add_common_api_args(disable_key)
@@ -760,12 +643,6 @@ def build_parser() -> argparse.ArgumentParser:
     delete_key.add_argument("--live", action="store_true")
     delete_key.add_argument("--hash", required=True)
     delete_key.set_defaults(func=cmd_delete_key)
-
-    run_with_key = subparsers.add_parser("run-with-key", help="Run a command with OPENROUTER_API_KEY from 1Password")
-    run_with_key.add_argument("--key-ref", required=True)
-    run_with_key.add_argument("--env-name", default=RUNTIME_ENV_DEFAULT)
-    run_with_key.add_argument("target_command", nargs=argparse.REMAINDER)
-    run_with_key.set_defaults(func=cmd_run_with_key)
 
     return parser
 

@@ -21,12 +21,12 @@ Create-key request fields currently supported by the CLI:
 - `limit`: optional USD spending limit.
 - `limit_reset`: optional `daily`, `weekly`, `monthly`, or `null`.
 
-OpenRouter returns the created runtime key once. The CLI must store it in 1Password before reporting success, and must not print the secret.
+OpenRouter returns the created runtime key once. The CLI must keep it in memory only long enough to inject it into the target subprocess, and must not print or persist the secret.
 
-1Password storage:
+Ephemeral runtime-key handling:
 
-- Use `API_CREDENTIAL` items.
-- Put the runtime key in the concealed `credential` field.
-- Put non-secret OpenRouter metadata in notes: hash, label, workspace, limit, reset, expiration.
-- Use secret references plus `op run` for command execution.
-- Do not pass secret values as `op item create` assignment arguments; use a JSON template over stdin.
+- Management keys may live in 1Password and be resolved with `op run`.
+- Runtime keys are created with `POST /keys`, passed as `OPENROUTER_API_KEY` to one subprocess, then deleted with `DELETE /keys/:hash`.
+- The subprocess environment should not inherit `OPENROUTER_MANAGEMENT_KEY`.
+- Capture and redact subprocess output before re-emitting it, because dynamically created runtime keys are not masked by `op run`.
+- If deletion fails, report only the non-secret key hash and cleanup error so an operator can revoke it manually.

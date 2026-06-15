@@ -32,6 +32,23 @@ class OpenRouterOpsTests(unittest.TestCase):
         self.assertEqual(redacted["data"]["hash"], "abc123")
         self.assertEqual(redacted["data"]["creator_user_id"], "<redacted>")
 
+    def test_redact_text_removes_exact_runtime_key(self) -> None:
+        fake_key = "sk-" + "or-v1-secret"
+        redacted = openrouter_ops.redact_text(f"token={fake_key}", fake_key)
+        self.assertNotIn(fake_key, redacted)
+        self.assertIn("<redacted-openrouter-key>", redacted)
+
+    def test_build_child_env_drops_management_key(self) -> None:
+        child_env = openrouter_ops.build_child_env(
+            {"OPENROUTER_MANAGEMENT_KEY": "management-secret", "PATH": "/bin"},
+            runtime_key="sk-or-v1-runtime",
+            runtime_env_name="OPENROUTER_API_KEY",
+            management_env_name="OPENROUTER_MANAGEMENT_KEY",
+        )
+        self.assertNotIn("OPENROUTER_MANAGEMENT_KEY", child_env)
+        self.assertEqual(child_env["OPENROUTER_API_KEY"], "sk-or-v1-runtime")
+        self.assertEqual(child_env["PATH"], "/bin")
+
     def test_build_create_payload_for_workspace_uuid(self) -> None:
         args = argparse.Namespace(
             name="ariadne-smoke",
@@ -71,10 +88,6 @@ class OpenRouterOpsTests(unittest.TestCase):
                 "1",
                 "--expires-at",
                 "2026-06-22T00:00:00Z",
-                "--op-vault",
-                "Test",
-                "--op-item",
-                "OpenRouter runtime - ariadne smoke",
             ],
             check=True,
             stdout=subprocess.PIPE,
@@ -88,7 +101,59 @@ class OpenRouterOpsTests(unittest.TestCase):
             output["request"]["body"]["workspace_id"],
             "550e8400-e29b-41d4-a716-446655440000",
         )
+        self.assertIn("run-ephemeral", output["next_step"])
         self.assertNotIn("sk-or-", proc.stdout)
+
+    def test_run_ephemeral_dry_run_does_not_need_secrets(self) -> None:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "run-ephemeral",
+                "--name",
+                "ariadne-smoke",
+                "--workspace",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "--limit",
+                "1",
+                "--expires-at",
+                "2026-06-22T00:00:00Z",
+                "--",
+                "echo",
+                "ok",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        output = json.loads(proc.stdout)
+        self.assertIs(output["ok"], True)
+        self.assertIs(output["live"], False)
+        self.assertEqual(output["operation"], "run-ephemeral")
+        self.assertEqual(output["command"], ["echo", "ok"])
+        self.assertEqual(output["cleanup"], {"on_exit": "delete-key"})
+        self.assertNotIn("sk-or-", proc.stdout)
+
+    def test_create_key_live_is_rejected(self) -> None:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "create-key",
+                "--live",
+                "--name",
+                "ariadne-smoke",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        output = json.loads(proc.stdout)
+        self.assertIs(output["ok"], False)
+        self.assertIn("run-ephemeral", output["error"])
 
 
 if __name__ == "__main__":
