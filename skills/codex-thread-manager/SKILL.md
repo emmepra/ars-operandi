@@ -16,7 +16,7 @@ Use this skill to create real Codex app threads that the user can see in the Cod
 - Native app thread tools are required for a user-visible Codex Desktop thread. If those tools are unavailable, say the tool surface cannot create a visible app thread in this session.
 - The App Server protocol and bundled fallback script are diagnostic fallbacks only. They must not be treated as successful user-facing thread creation unless they verify a Desktop-visible source.
 - Treat `cli`, `vscode`, and `appServer` thread sources as non-user-visible for Codex Desktop purposes.
-- Verify creation before telling the user a thread exists.
+- Verify creation before telling the user a thread exists. When an explicit model/effort policy applies, read back the effective values; requested arguments and title verification are not sufficient evidence.
 - Follow the most specific explicit user/workspace model policy. Otherwise omit model and reasoning overrides so the configured Codex defaults apply.
 - Never hard-code a particular effort as a universal thread-manager default. A workspace such as Cerebro may require an explicit model/effort pair; pass that pair through native tools or the fallback script exactly.
 
@@ -135,7 +135,7 @@ For read-only research/review threads, set read-only intent clearly and tell the
 
 1. Prefer native app thread tools if the tool surface exposes them.
 2. If native tools are not exposed, do not create a subagent, `codex exec` run, CLI session, or App Server session as a substitute for a visible app thread.
-3. Use `scripts/create_app_thread.mjs` only when a diagnostic fallback is explicitly useful, then require `verified: true` and `visible: true`.
+3. Use `scripts/create_app_thread.mjs` only when a diagnostic fallback is explicitly useful, then require `verified: true`, `visible: true`, and `settingsVerified: true`. The helper reads effective model/reasoning from the App Server `thread/start` response and stops before the delegated turn when an explicit value mismatches.
 4. If the fallback returns `verified: false`, `visible: false`, or a non-user-visible `source`, report that no visible Codex app thread was created. Include the attempted title, cwd, and verification error.
 5. Report the thread title, id, cwd, and whether the turn completed or is still running only after user-visible verification succeeds.
 
@@ -158,13 +158,13 @@ Use `--sandbox read-only` for pure planning/review. Use `--approval on-request` 
 
 ## Verification
 
-Treat a thread as created only after at least one of these succeeds:
+Treat a thread as created and model-policy compliant only after both identity/visibility and effective settings are verified:
 
-- native thread tool returns a thread id and a later list/read confirms the title
-- fallback script prints both `verified: true` and `visible: true`
-- App Server `thread/list` finds the same id and title with a source that is not `cli`, `vscode`, or `appServer`
+- native thread tool returns a thread id, a later list/read confirms the title, and supported thread metadata reads back the effective model and effort when an explicit policy applies;
+- fallback script prints `verified: true`, `visible: true`, and `settingsVerified: true`, with `effectiveModel`/`effectiveEffort` matching the explicit request;
+- App Server creation reads effective model/effort from `thread/start`, and `thread/list` finds the same id/title with a source that is not `cli`, `vscode`, or `appServer`.
 
-If verification fails, say so and do not claim the thread is visible. If a fallback created a non-visible session, call it an App Server diagnostic session, not a Codex app thread.
+Title/source verification alone never proves model compliance. If effective settings cannot be read back, say the thread settings are unverified and do not mark the relevant acceptance criterion complete. If a fallback created a non-visible session, call it an App Server diagnostic session, not a Codex app thread.
 
 ## Updating The Procedure
 

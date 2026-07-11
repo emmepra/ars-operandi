@@ -102,6 +102,11 @@ let commandCount = 0;
 let fileChangeCount = 0;
 let matchedThread = null;
 let verificationError = "not_checked";
+let settingsVerificationError = "not_checked";
+let effectiveModel = null;
+let effectiveEffort = null;
+let settingsVerified = false;
+let modelReroute = null;
 
 const nonUserVisibleSources = new Set(["cli", "vscode", "appServer"]);
 
@@ -129,6 +134,27 @@ function verifyThreadList(result) {
   return true;
 }
 
+function readBackEffectiveSettings(result) {
+  effectiveModel = typeof result?.model === "string" ? result.model : null;
+  effectiveEffort = typeof result?.reasoningEffort === "string" ? result.reasoningEffort : null;
+
+  if (!effectiveModel) {
+    settingsVerificationError = "thread_start_missing_effective_model";
+    return false;
+  }
+  if (args.model && effectiveModel !== args.model) {
+    settingsVerificationError = `effective_model_mismatch:requested=${args.model},actual=${effectiveModel}`;
+    return false;
+  }
+  if (args.effort && effectiveEffort !== args.effort) {
+    settingsVerificationError = `effective_effort_mismatch:requested=${args.effort},actual=${effectiveEffort ?? "null"}`;
+    return false;
+  }
+
+  settingsVerificationError = null;
+  return true;
+}
+
 function send(message) {
   proc.stdin.write(`${JSON.stringify(message)}\n`);
 }
@@ -139,8 +165,13 @@ function finish(code) {
     threadId,
     title: args.title,
     cwd: args.cwd,
-    model: args.model ?? null,
-    effort: args.effort ?? null,
+    requestedModel: args.model ?? null,
+    requestedEffort: args.effort ?? null,
+    effectiveModel,
+    effectiveEffort,
+    settingsVerified,
+    settingsVerificationError,
+    modelReroute,
     completed,
     created: Boolean(threadId),
     verified,
@@ -174,7 +205,20 @@ rl.on("line", (line) => {
 
   if (message.id === 1 && message.result?.thread?.id && !threadId) {
     threadId = message.result.thread.id;
-    console.log(JSON.stringify({ event: "thread_started", threadId, cwd: message.result.cwd }));
+    settingsVerified = readBackEffectiveSettings(message.result);
+    console.log(JSON.stringify({
+      event: "thread_started",
+      threadId,
+      cwd: message.result.cwd,
+      effectiveModel,
+      effectiveEffort,
+      settingsVerified,
+      settingsVerificationError,
+    }));
+    if (!settingsVerified) {
+      finish(4);
+      return;
+    }
     send({ method: "thread/name/set", id: 2, params: { threadId, name: args.title } });
     send({
       method: "turn/start",
@@ -186,6 +230,7 @@ rl.on("line", (line) => {
         runtimeWorkspaceRoots: [args.cwd],
         approvalPolicy: args.approval,
         sandboxPolicy: sandboxPolicy(args.sandbox, args.cwd),
+        ...(args.model ? { model: args.model } : {}),
         ...(args.effort ? { effort: args.effort } : {}),
       },
     });
@@ -217,6 +262,20 @@ rl.on("line", (line) => {
     return;
   }
 
+  if (message.method === "model/rerouted" && message.params?.threadId === threadId) {
+    modelReroute = {
+      fromModel: message.params.fromModel ?? null,
+      toModel: message.params.toModel ?? null,
+      reason: message.params.reason ?? null,
+    };
+    effectiveModel = message.params.toModel ?? effectiveModel;
+    if (args.model && effectiveModel !== args.model) {
+      settingsVerified = false;
+      settingsVerificationError = `model_rerouted:requested=${args.model},actual=${effectiveModel}`;
+    }
+    return;
+  }
+
   if (message.method === "turn/completed") {
     completed = true;
     send({
@@ -242,7 +301,7 @@ rl.on("line", (line) => {
     }
 
     visible = verifyThreadList(message.result);
-    verified = visible;
+    verified = visible && settingsVerified && !settingsVerificationError;
     finish(verified ? 0 : 3);
   }
 });
