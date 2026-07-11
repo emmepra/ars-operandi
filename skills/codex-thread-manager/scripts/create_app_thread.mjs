@@ -8,7 +8,8 @@ function usage() {
   create_app_thread.mjs --cwd PATH --title TITLE (--prompt TEXT | --prompt-file FILE) [options]
 
 Options:
-  --effort VALUE       Reasoning effort, default: xhigh
+  --model VALUE        Model override; default: configured Codex model
+  --effort VALUE       Reasoning effort override; default: configured Codex effort
   --sandbox VALUE      read-only | workspace-write | danger-full-access, default: workspace-write
   --approval VALUE     never | on-request | untrusted, default: on-request
   --timeout-ms VALUE   Wait timeout, default: 1800000
@@ -17,7 +18,6 @@ Options:
 
 function parseArgs(argv) {
   const args = {
-    effort: "xhigh",
     sandbox: "workspace-write",
     approval: "on-request",
     timeoutMs: 30 * 60 * 1000,
@@ -35,6 +35,8 @@ function parseArgs(argv) {
       args.prompt = value; i += 1;
     } else if (key === "--prompt-file") {
       args.promptFile = value; i += 1;
+    } else if (key === "--model") {
+      args.model = value; i += 1;
     } else if (key === "--effort") {
       args.effort = value; i += 1;
     } else if (key === "--sandbox") {
@@ -83,7 +85,10 @@ if (args.help) {
 requireArgs(args);
 
 const prompt = args.promptFile ? readFileSync(args.promptFile, "utf8") : args.prompt;
-const proc = spawn("codex", ["app-server", "--listen", "stdio://"], {
+const appServerArgs = ["app-server", "--listen", "stdio://"];
+if (args.model) appServerArgs.push("-c", `model=${JSON.stringify(args.model)}`);
+if (args.effort) appServerArgs.push("-c", `model_reasoning_effort=${JSON.stringify(args.effort)}`);
+const proc = spawn("codex", appServerArgs, {
   stdio: ["pipe", "pipe", "pipe"],
 });
 const rl = readline.createInterface({ input: proc.stdout });
@@ -134,6 +139,8 @@ function finish(code) {
     threadId,
     title: args.title,
     cwd: args.cwd,
+    model: args.model ?? null,
+    effort: args.effort ?? null,
     completed,
     created: Boolean(threadId),
     verified,
@@ -179,7 +186,7 @@ rl.on("line", (line) => {
         runtimeWorkspaceRoots: [args.cwd],
         approvalPolicy: args.approval,
         sandboxPolicy: sandboxPolicy(args.sandbox, args.cwd),
-        effort: args.effort,
+        ...(args.effort ? { effort: args.effort } : {}),
       },
     });
     return;

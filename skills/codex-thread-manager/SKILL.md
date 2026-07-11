@@ -9,7 +9,7 @@ Use this skill to create real Codex app threads that the user can see in the Cod
 
 ## Core Rules
 
-- Create user-facing app threads, not subagents, unless the user explicitly asks for subagents or delegation.
+- When the user requests a visible app thread, do not substitute a subagent for it. Within that thread, bounded executor/validator subagents may be used when the active workspace policy calls for independent delegation.
 - Do not use `codex exec` for app threads. Use it only for explicit non-interactive report runs, and say it will not appear as a normal app thread.
 - Do not use unverified deep links as a creation fallback.
 - Prefer native app thread tools when available: `create_thread`, `list_threads`, `read_thread`, `send_message_to_thread`, `set_thread_title`.
@@ -17,8 +17,8 @@ Use this skill to create real Codex app threads that the user can see in the Cod
 - The App Server protocol and bundled fallback script are diagnostic fallbacks only. They must not be treated as successful user-facing thread creation unless they verify a Desktop-visible source.
 - Treat `cli`, `vscode`, and `appServer` thread sources as non-user-visible for Codex Desktop purposes.
 - Verify creation before telling the user a thread exists.
-- Keep the current/default model unless the user asks for a model override.
-- Always request extra-high reasoning for user-requested project threads: with native `create_thread` / `send_message_to_thread`, pass `thinking: "xhigh"` explicitly; with the fallback script, pass `--effort xhigh` or rely on its `xhigh` default.
+- Follow the most specific explicit user/workspace model policy. Otherwise omit model and reasoning overrides so the configured Codex defaults apply.
+- Never hard-code a particular effort as a universal thread-manager default. A workspace such as Cerebro may require an explicit model/effort pair; pass that pair through native tools or the fallback script exactly.
 
 ## Coordination Model
 
@@ -104,14 +104,15 @@ A project thread prompt should include:
 - verification expectations
 - final status format
 
-Native tool calls must include `thinking: "xhigh"` for user-requested project threads unless the user explicitly asks for a lower effort. Do not rely on the app default for reasoning effort.
+Native tool calls must follow the explicit user/workspace model policy when one exists. If no such policy exists, omit `model` and `thinking` so Codex inherits the configured defaults. Do not silently substitute a different effort.
 
 Example native creation shape:
 
 ```json
 {
   "target": {"type": "project", "projectId": "/path/to/workspace", "environment": {"type": "local"}},
-  "thinking": "xhigh",
+  "model": "<explicit-model-policy>",
+  "thinking": "<explicit-reasoning-policy>",
   "prompt": "..."
 }
 ```
@@ -125,7 +126,7 @@ Use workflow-context to fetch the relevant Linear issue, project registry entry,
 For implementation threads, include this default guardrail:
 
 ```text
-Do not commit, push, open PRs, deploy, send messages, mutate external systems, spawn subagents, or start heartbeat/monitor automations unless explicitly asked. If blocked, explain the exact blocker instead of guessing.
+Do not commit, push, open PRs, deploy, send messages, mutate external systems, create additional user-facing tasks, or start heartbeat/monitor automations unless explicitly asked. Use bounded subagents only when the workspace policy or delegated objective calls for them, and keep authoritative validation independent from execution. If blocked, explain the exact blocker instead of guessing.
 ```
 
 For read-only research/review threads, set read-only intent clearly and tell the thread not to edit files.
@@ -145,10 +146,13 @@ node skills/codex-thread-manager/scripts/create_app_thread.mjs \
   --cwd <project-root-or-worktree> \
   --title "<area>-<project_slug> - <issue_id>-<workstream_slug>" \
   --prompt-file /tmp/thread-prompt.md \
-  --effort xhigh \
+  --model <explicit-model-policy> \
+  --effort <explicit-reasoning-policy> \
   --sandbox workspace-write \
   --approval never
 ```
+
+Omit `--model` and `--effort` when no explicit policy exists; the helper then inherits the configured Codex defaults.
 
 Use `--sandbox read-only` for pure planning/review. Use `--approval on-request` when the thread may need user-confirmed actions. Use `--approval never` only when the prompt forbids high-impact actions and the sandbox is appropriately scoped.
 
