@@ -1,0 +1,42 @@
+version: 3
+workspace: sample-workspace
+coverage:
+  policy: registered-projects
+linear_connections:
+  linear-alpha:
+    adapter: dual-linear-mcp
+    credential_profile: credential-alpha
+    expected_workspace: sample-alpha
+    expected_workspace_id: workspace-alpha
+    binding_state: verified
+  linear-beta:
+    adapter: dual-linear-mcp
+    credential_profile: credential-beta
+    expected_workspace: sample-beta
+    expected_workspace_id: workspace-beta
+    binding_state: verified
+tracking_profiles:
+  alpha:
+    portfolio:
+      type: linear
+      connection: linear-alpha
+    execution:
+      type: github-issues
+  beta:
+    portfolio:
+      type: linear
+      connection: linear-beta
+    execution:
+      type: github-issues
+projects:
+  - key: sample-alpha
+    name: Sample Alpha Project
+    aliases:
+      - alpha
+    tracking: alpha
+    linear_project_id: project-alpha
+  - key: sample-beta
+    name: Sample Beta Project
+    aliases:
+      - beta
+    tracking: beta
