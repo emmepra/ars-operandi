@@ -9,6 +9,7 @@ It complements Ora et Labora. Ora et Labora defines the repo-first workflow: iss
 | Skill | Use for |
 | --- | --- |
 | `codex-thread-manager` | User-facing Codex app thread creation, naming, verification, and project/workstream coordination |
+| `mailctl-email-access` | Fail-closed, bounded Gmail metadata access through a consumer-provided `mailctl` runtime |
 | `openrouter-ops` | OpenRouter workspace/key operations, ephemeral runtime key injection, and safe revoke/rotate workflows |
 | `railway-deploy` | Railway deployment, release, variables, services, Postgres links, domains, smoke checks, and rollback notes |
 
@@ -21,6 +22,7 @@ Copy or install the relevant skill folder into your Codex skills directory, or k
 ```bash
 cp -R skills/railway-deploy ~/.codex/skills/
 cp -R skills/codex-thread-manager ~/.codex/skills/
+cp -R skills/mailctl-email-access ~/.codex/skills/
 cp -R skills/openrouter-ops ~/.codex/skills/
 ```
 
@@ -28,6 +30,7 @@ Invoke explicitly when needed:
 
 ```text
 Use $railway-deploy to deploy this app on Railway.
+Use $mailctl-email-access for bounded Gmail metadata from one explicit consumer route.
 ```
 
 ## Credential Policy
