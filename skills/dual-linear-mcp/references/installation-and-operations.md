@@ -11,6 +11,8 @@ The server uses `op read` without a shell. It preloads every verified profile at
 
 Linear personal API keys use the default `--auth-scheme api-key`. For OAuth access tokens, start with `--auth-scheme bearer`.
 
+The URI template is one deterministic mapping, so the selected items must share a vault and field shape. A common setup uses item titles equal to each `credential_profile` and one concealed `credential` field. Do not put a token in an environment variable, manifest, command argument, or config file.
+
 ## Validate without installing
 
 The safe dry run is the credential-free manifest and route check:
@@ -25,6 +27,20 @@ uv run --script /absolute/path/to/dual_linear_mcp.py resolve \
 ```
 
 There is intentionally no mutation dry-run that pretends a write occurred. The MCP server is read-only by default because mutation handlers reject calls unless `--enable-mutations` is present.
+
+## Bootstrap planned connections
+
+Bootstrap is a read-only CLI path for a consumer manifest whose connections do not yet have stable workspace IDs:
+
+```bash
+uv run --script /absolute/path/to/dual_linear_mcp.py bootstrap \
+  --manifest /absolute/path/to/projects.yaml \
+  --connection-alias linear-alpha \
+  --connection-alias linear-beta \
+  --op-reference-template 'op://Operations/{profile}/credential'
+```
+
+Every alias is explicit. The process preloads only the selected credentials, discovers each workspace and its teams, and emits a candidate `expected_workspace_id`; it does not edit the manifest or make a planned route callable. A consumer owner must compare the returned identity with an independent trusted account view before recording the stable ID and changing `binding_state` to `verified`. Rerun bootstrap after that change: an ID mismatch then fails closed.
 
 ## Add a read-only Codex STDIO server
 
@@ -61,7 +77,7 @@ enabled_tools = [
 default_tools_approval_mode = "writes"
 ```
 
-Restart the Codex client after configuration, then inspect the server with `codex mcp list` or `/mcp`. Use discovery with each connection and compare the returned workspace/team IDs with the intended manifest binding before enabling any mutation.
+Configure the MCP server only after all intended bindings are `verified`. Restart the Codex client after configuration, then inspect the server with `codex mcp list` or `/mcp`. Use discovery with each connection and compare the returned workspace/team IDs with the intended manifest binding before enabling any mutation.
 
 ## Temporarily enable mutations
 

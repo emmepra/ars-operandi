@@ -378,6 +378,36 @@ class Manifest:
             )
         )
 
+    def _connection_alias(self, selector: str) -> str:
+        normalized = _normalize(selector)
+        matches = [
+            alias for alias in self.connections if _normalize(alias) == normalized
+        ]
+        if not matches:
+            raise AdapterError(
+                "unknown_connection",
+                "No Linear connection matches the requested alias.",
+                details={"connection_alias": selector},
+            )
+        if len(matches) != 1:
+            raise AdapterError(
+                "ambiguous_connection", "The Linear connection alias is ambiguous."
+            )
+        return matches[0]
+
+    def connection_for_bootstrap(self, connection_alias: str) -> LinearConnection:
+        """Select one explicit non-blocked connection without enabling routing."""
+
+        alias = self._connection_alias(connection_alias)
+        connection = self.connections[alias]
+        if connection.binding_state == "blocked":
+            raise AdapterError(
+                "connection_blocked",
+                "The selected Linear connection is blocked and cannot be bootstrapped.",
+                details={"connection_alias": alias},
+            )
+        return connection
+
     def resolve(
         self,
         *,
@@ -409,21 +439,7 @@ class Manifest:
             project_binding = matches[0]
             alias = self.tracking_connections[project_binding.tracking_profile]
         else:
-            normalized = _normalize(connection_alias or "")
-            matches = [
-                alias for alias in self.connections if _normalize(alias) == normalized
-            ]
-            if not matches:
-                raise AdapterError(
-                    "unknown_connection",
-                    "No Linear connection matches the requested alias.",
-                    details={"connection_alias": connection_alias},
-                )
-            if len(matches) != 1:
-                raise AdapterError(
-                    "ambiguous_connection", "The Linear connection alias is ambiguous."
-                )
-            alias = matches[0]
+            alias = self._connection_alias(connection_alias or "")
 
         connection = self.connections[alias]
         if connection.binding_state != "verified":
@@ -971,6 +987,43 @@ class AdapterService:
             ).public_payload()
         }
 
+    def bootstrap_connection(self, *, connection_alias: str) -> dict[str, Any]:
+        """Discover a planned connection without promoting or persisting it."""
+
+        connection = self.manifest.connection_for_bootstrap(connection_alias)
+        token = self.secrets.get(connection.credential_profile)
+        identity = self._transport_call(lambda: self.transport.discover_identity(token))
+        if (
+            connection.expected_workspace_id is not None
+            and identity.workspace_id != connection.expected_workspace_id
+        ):
+            raise AdapterError(
+                "workspace_identity_mismatch",
+                "The credential resolved to a different Linear workspace.",
+                details={"connection_alias": connection.alias},
+            )
+        is_verified = connection.binding_state == "verified"
+        return {
+            "connection_alias": connection.alias,
+            "binding_state": connection.binding_state,
+            "expected_workspace": connection.expected_workspace,
+            "identity": {
+                "workspace_id": identity.workspace_id,
+                "workspace_name": identity.workspace_name,
+                "teams": [asdict(team) for team in identity.teams],
+            },
+            "candidate": {
+                "expected_workspace_id": identity.workspace_id,
+                "binding_state": "verified",
+            },
+            "eligible_for_routing": is_verified,
+            "verification": (
+                "workspace-identity-verified"
+                if is_verified
+                else "workspace-identity-candidate"
+            ),
+        }
+
     def discover(
         self,
         *,
@@ -1305,21 +1358,35 @@ def _parser() -> argparse.ArgumentParser:
     selector.add_argument("--project")
     selector.add_argument("--connection-alias")
 
+    bootstrap = subparsers.add_parser("bootstrap")
+    bootstrap.add_argument("--manifest", type=Path, required=True)
+    bootstrap.add_argument(
+        "--connection-alias",
+        action="append",
+        required=True,
+        help="Explicit connection alias; repeat to bootstrap more than one profile.",
+    )
+    _add_provider_arguments(bootstrap)
+
     serve = subparsers.add_parser("serve")
     serve.add_argument("--manifest", type=Path, required=True)
-    serve.add_argument(
+    _add_provider_arguments(serve)
+    serve.add_argument("--enable-mutations", action="store_true")
+    return parser
+
+
+def _add_provider_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
         "--op-reference-template",
         default=os.environ.get("DUAL_LINEAR_OP_REFERENCE_TEMPLATE"),
         help="Non-secret op:// URI template containing {profile}.",
     )
-    serve.add_argument("--op-executable", default="op")
-    serve.add_argument("--linear-endpoint", default=LINEAR_ENDPOINT)
-    serve.add_argument(
+    parser.add_argument("--op-executable", default="op")
+    parser.add_argument("--linear-endpoint", default=LINEAR_ENDPOINT)
+    parser.add_argument(
         "--auth-scheme", choices=("api-key", "bearer"), default="api-key"
     )
-    serve.add_argument("--timeout-seconds", type=float, default=20.0)
-    serve.add_argument("--enable-mutations", action="store_true")
-    return parser
+    parser.add_argument("--timeout-seconds", type=float, default=20.0)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1355,7 +1422,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.op_reference_template:
             raise AdapterError(
                 "invalid_configuration",
-                "serve requires --op-reference-template or DUAL_LINEAR_OP_REFERENCE_TEMPLATE.",
+                "This command requires --op-reference-template or DUAL_LINEAR_OP_REFERENCE_TEMPLATE.",
             )
         backend = OnePasswordSecretProvider(
             args.op_reference_template,
@@ -1363,13 +1430,50 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
         )
         secrets = MemoryCachingSecretProvider(backend, redactor)
-        secrets.preload(manifest.verified_credential_profiles())
         transport = LinearGraphQLTransport(
             endpoint=args.linear_endpoint,
             timeout_seconds=args.timeout_seconds,
             auth_scheme=args.auth_scheme,
             redactor=redactor,
         )
+        if args.command == "bootstrap":
+            selected = tuple(
+                manifest.connection_for_bootstrap(alias)
+                for alias in args.connection_alias
+            )
+            if len({connection.alias for connection in selected}) != len(selected):
+                raise AdapterError(
+                    "invalid_selector",
+                    "Bootstrap connection aliases must not be repeated.",
+                )
+            secrets.preload(
+                tuple(
+                    sorted({connection.credential_profile for connection in selected})
+                )
+            )
+            service = AdapterService(
+                manifest=manifest,
+                secrets=secrets,
+                transport=transport,
+                mutations_enabled=False,
+                redactor=redactor,
+            )
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "connections": [
+                            service.bootstrap_connection(
+                                connection_alias=connection.alias
+                            )
+                            for connection in selected
+                        ],
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        secrets.preload(manifest.verified_credential_profiles())
         service = AdapterService(
             manifest=manifest,
             secrets=secrets,

@@ -18,7 +18,7 @@ Use [example-manifest.yaml](example-manifest.yaml) as a sanitized fixture. Extra
 - `tracking_profiles.<name>.portfolio`: `type: linear` and one known `connection`.
 - `projects[]`: `key`, `tracking`, optional `name`, `aliases`, and `linear_project_id`.
 
-Only `binding_state: verified` can resolve. `planned`, `blocked`, missing references, unknown selectors, and ambiguous selectors fail closed. Supplying both a project and connection alias also fails.
+Only `binding_state: verified` can resolve. `planned`, `blocked`, missing references, unknown selectors, and ambiguous selectors fail closed. Supplying both a project and connection alias also fails. The CLI-only `bootstrap` path may inspect one explicitly selected `planned` connection, but its candidate output never changes routing eligibility.
 
 The `adapter` value must be `dual-linear-mcp` for generic manifests or `cerebro` for the compatible Cerebro Project Index contract. Other adapter types fail validation instead of being routed accidentally.
 
@@ -34,6 +34,8 @@ The `adapter` value must be `dual-linear-mcp` for generic manifests or `cerebro`
 
 There is no delete, generic mutation, generic GraphQL, or fallback tool.
 
+`bootstrap` is a read-only CLI command, not an MCP tool. It requires one or more explicit connection aliases, rejects blocked aliases, preloads only their credential profiles, and never writes the consumer manifest. A connection with an existing stable ID must match it; otherwise the command returns a candidate that still requires independent operator confirmation.
+
 ## Identity and read-back
 
 Before every mutation, the adapter uses the selected credential to fetch the Linear organization and all accessible teams. It compares the organization ID with `expected_workspace_id` and requires the target issue team to be in that identity response.
@@ -46,4 +48,4 @@ After create or update, the adapter performs a separate issue read through the s
 
 Tool failures return a stable error code and a sanitized message. Runtime secrets are registered with an in-memory exact-value redactor. GraphQL error messages and response bodies are suppressed; only safe status or extension codes may be returned.
 
-Treat these codes as hard stops: `unknown_project`, `unknown_connection`, `ambiguous_project`, `connection_not_verified`, `workspace_identity_mismatch`, `team_identity_mismatch`, `project_identity_mismatch`, `mutations_disabled`, `mutation_confirmation_required`, `operation_not_allowed`, and `read_back_failed`.
+Treat these codes as hard stops: `unknown_project`, `unknown_connection`, `ambiguous_project`, `connection_not_verified`, `connection_blocked`, `workspace_identity_mismatch`, `team_identity_mismatch`, `project_identity_mismatch`, `mutations_disabled`, `mutation_confirmation_required`, `operation_not_allowed`, and `read_back_failed`.

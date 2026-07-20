@@ -184,6 +184,30 @@ class ManifestAndRoutingTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "connection_not_verified")
 
+    def test_planned_binding_can_be_selected_only_for_bootstrap(self) -> None:
+        data = dual_linear_mcp.load_yaml(FIXTURE)
+        data["linear_connections"]["linear-alpha"]["binding_state"] = "planned"
+        data["linear_connections"]["linear-alpha"].pop("expected_workspace_id")
+        manifest = dual_linear_mcp.Manifest.from_data(data)
+
+        connection = manifest.connection_for_bootstrap("linear-alpha")
+
+        self.assertEqual(connection.alias, "linear-alpha")
+        self.assertEqual(connection.binding_state, "planned")
+        with self.assertRaises(dual_linear_mcp.AdapterError) as caught:
+            manifest.resolve(connection_alias="linear-alpha")
+        self.assertEqual(caught.exception.code, "connection_not_verified")
+
+    def test_blocked_binding_cannot_be_bootstrapped(self) -> None:
+        data = dual_linear_mcp.load_yaml(FIXTURE)
+        data["linear_connections"]["linear-alpha"]["binding_state"] = "blocked"
+        manifest = dual_linear_mcp.Manifest.from_data(data)
+
+        with self.assertRaises(dual_linear_mcp.AdapterError) as caught:
+            manifest.connection_for_bootstrap("linear-alpha")
+
+        self.assertEqual(caught.exception.code, "connection_blocked")
+
     def test_missing_connection_reference_is_rejected(self) -> None:
         data = dual_linear_mcp.load_yaml(FIXTURE)
         data["tracking_profiles"]["alpha"]["portfolio"]["connection"] = "missing"
@@ -277,6 +301,44 @@ class SecretAndIdentityTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "workspace_identity_mismatch")
         self.assertEqual(transport.created_with, [])
+
+    def test_bootstrap_discovers_planned_identity_without_promoting_manifest(
+        self,
+    ) -> None:
+        data = dual_linear_mcp.load_yaml(FIXTURE)
+        data["linear_connections"]["linear-alpha"]["binding_state"] = "planned"
+        data["linear_connections"]["linear-alpha"].pop("expected_workspace_id")
+        manifest = dual_linear_mcp.Manifest.from_data(data)
+        backend = CountingSecretProvider({"credential-alpha": "token-alpha"})
+        redactor = dual_linear_mcp.SecretRedactor()
+        service = dual_linear_mcp.AdapterService(
+            manifest=manifest,
+            secrets=dual_linear_mcp.MemoryCachingSecretProvider(backend, redactor),
+            transport=FakeLinearTransport(),
+            mutations_enabled=False,
+            redactor=redactor,
+        )
+
+        result = service.bootstrap_connection(connection_alias="linear-alpha")
+
+        self.assertEqual(result["connection_alias"], "linear-alpha")
+        self.assertEqual(result["binding_state"], "planned")
+        self.assertEqual(
+            result["candidate"]["expected_workspace_id"], "workspace-alpha"
+        )
+        self.assertEqual(result["candidate"]["binding_state"], "verified")
+        self.assertEqual(result["verification"], "workspace-identity-candidate")
+        self.assertFalse(result["eligible_for_routing"])
+        self.assertIsNone(manifest.connections["linear-alpha"].expected_workspace_id)
+        self.assertEqual(backend.calls, ["credential-alpha"])
+
+    def test_bootstrap_rejects_mismatch_for_connection_with_stable_id(self) -> None:
+        service, _, _ = build_service(tokens={"credential-alpha": "token-beta"})
+
+        with self.assertRaises(dual_linear_mcp.AdapterError) as caught:
+            service.bootstrap_connection(connection_alias="linear-alpha")
+
+        self.assertEqual(caught.exception.code, "workspace_identity_mismatch")
 
     def test_unknown_team_is_rejected_before_mutation(self) -> None:
         service, _, transport = build_service(mutations_enabled=True)
@@ -434,6 +496,64 @@ class McpContractTests(unittest.TestCase):
         self.assertEqual(set(by_name), set(dual_linear_mcp.TOOL_NAMES))
         self.assertTrue(by_name["linear_discover"].annotations.readOnlyHint)
         self.assertFalse(by_name["linear_create_issue"].annotations.readOnlyHint)
+
+
+class BootstrapCliTests(unittest.TestCase):
+    def test_bootstrap_preloads_both_explicit_profiles_and_emits_candidates(
+        self,
+    ) -> None:
+        data = dual_linear_mcp.load_yaml(FIXTURE)
+        for connection in data["linear_connections"].values():
+            connection["binding_state"] = "planned"
+            connection.pop("expected_workspace_id")
+        manifest = dual_linear_mcp.Manifest.from_data(data)
+        backend = CountingSecretProvider(
+            {
+                "credential-alpha": "token-alpha",
+                "credential-beta": "token-beta",
+            }
+        )
+        transport = FakeLinearTransport()
+
+        with (
+            mock.patch.object(dual_linear_mcp.Manifest, "load", return_value=manifest),
+            mock.patch.object(
+                dual_linear_mcp,
+                "OnePasswordSecretProvider",
+                return_value=backend,
+            ),
+            mock.patch.object(
+                dual_linear_mcp,
+                "LinearGraphQLTransport",
+                return_value=transport,
+            ),
+            mock.patch("builtins.print") as output,
+        ):
+            result = dual_linear_mcp.main(
+                [
+                    "bootstrap",
+                    "--manifest",
+                    "/explicit/projects.yaml",
+                    "--connection-alias",
+                    "linear-alpha",
+                    "--connection-alias",
+                    "linear-beta",
+                    "--op-reference-template",
+                    "op://Sample/{profile}/credential",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(sorted(backend.calls), ["credential-alpha", "credential-beta"])
+        payload = json.loads(output.call_args.args[0])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(len(payload["connections"]), 2)
+        self.assertTrue(
+            all(
+                item["verification"] == "workspace-identity-candidate"
+                for item in payload["connections"]
+            )
+        )
 
 
 if __name__ == "__main__":
