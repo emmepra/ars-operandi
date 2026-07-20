@@ -10,6 +10,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = REPO_ROOT / "skills" / "mailctl-email-access"
 SKILL_PATH = SKILL_DIR / "SKILL.md"
+PUBLIC_TEXT_SURFACES = (
+    SKILL_PATH,
+    SKILL_DIR / "agents" / "openai.yaml",
+    REPO_ROOT / "README.md",
+)
 
 
 class MailctlEmailAccessSkillContractTests(unittest.TestCase):
@@ -18,10 +23,13 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
 
         required_markers = (
             "consumer-provided `mailctl`",
-            "sole Gmail runtime",
+            "sole mail runtime",
             "<runtime-repo>",
             "<provider>",
-            "Proceed only when `<provider>` is exactly `gmail`",
+            "exactly `gws` or `proton`",
+            "one canonical `mailctl` dispatches internally",
+            "unknown provider",
+            "provider mismatch",
             "no cross-provider fallback",
             "--project-index \"<project-index>\"",
             "--config-root \"<config-root>\"",
@@ -63,26 +71,93 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
                     line,
                 )
 
-    def test_skill_has_no_second_runner_or_private_consumer_data(self) -> None:
+    def test_skill_keeps_provider_specific_onboarding_and_reads_fail_closed(self) -> None:
         text = SKILL_PATH.read_text(encoding="utf-8")
-        lowered = text.lower()
 
+        required_markers = (
+            "GWS OAuth is available only for a `gws` route",
+            "unavailable for a `proton` route",
+            "Proton activation is a separate confirmed human gate",
+            "must not install, sign in to, or configure Proton Mail Bridge",
+            "must not create, read, print, or reveal credentials",
+            "at most 31 days",
+            "100 results",
+            "1000 matched UIDs",
+            "pinned `localhost` STARTTLS",
+            "dedicated macOS Keychain reference",
+            "fixed `From`, `To`, `Subject`, and `Date` headers",
+            "SMTP",
+            "raw IMAP",
+            "binding is `planned`",
+            "binding is `verified`",
+            "GWS selectors",
+            "`OR`, braces, pipe, `in:anywhere`, `older_than`, and `newer_than`",
+        )
+        for marker in required_markers:
+            with self.subTest(marker=marker):
+                self.assertIn(marker, text)
+
+        proton_search = re.search(
+            r"Proton bounded search[^`]*```bash\n(?P<command>[^`]+)```",
+            text,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(proton_search)
+        assert proton_search is not None
+        command = proton_search.group("command")
+        self.assertIn('mailctl search --account "<proton-alias>"', command)
+        self.assertNotIn("--query", command)
+
+        gws_search = re.search(
+            r"GWS bounded search[^`]*```bash\n(?P<command>[^`]+)```",
+            text,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(gws_search)
+        assert gws_search is not None
+        self.assertIn('--query "<selector>"', gws_search.group("command"))
+
+        self.assertNotIn("Proceed only when `<provider>` is exactly `gmail`", text)
+
+    def test_ui_metadata_is_provider_aware(self) -> None:
+        metadata = (SKILL_DIR / "agents" / "openai.yaml").read_text(encoding="utf-8")
+
+        self.assertIn("GWS or Proton metadata", metadata)
+        self.assertIn("provider-aware", metadata)
+        self.assertNotIn("bounded Gmail metadata", metadata)
+
+    def test_skill_has_no_second_runner_or_private_consumer_data(self) -> None:
         self.assertFalse((SKILL_DIR / "scripts").exists())
-        for forbidden in (
-            "subprocess",
-            "googleapiclient",
-            "requests.",
-            "gws gmail",
-            "/users/",
-            "/home/",
-            "gmail.com",
-            "uniroma1",
-            "icarofoundation",
-        ):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, lowered)
+        for surface in PUBLIC_TEXT_SURFACES:
+            text = surface.read_text(encoding="utf-8")
+            lowered = text.lower()
+            for forbidden in (
+                "subprocess",
+                "googleapiclient",
+                "requests.",
+                "gws gmail",
+                "/users/",
+                "/home/",
+                "gmail.com",
+                "uniroma1",
+                "icarofoundation",
+            ):
+                with self.subTest(surface=surface.name, forbidden=forbidden):
+                    self.assertNotIn(forbidden, lowered)
 
-        self.assertIsNone(re.search(r"\b(personal|sapienza|icaro)\b", lowered))
+            with self.subTest(surface=surface.name, check="private-aliases"):
+                self.assertIsNone(
+                    re.search(r"\b(personal|sapienza|icaro)\b", lowered)
+                )
+            with self.subTest(surface=surface.name, check="email-addresses"):
+                self.assertIsNone(
+                    re.search(
+                        r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+                        text,
+                    )
+                )
+            with self.subTest(surface=surface.name, check="absolute-paths"):
+                self.assertIsNone(re.search(r"(?i)(?:/users|/home)/[^<\s]", text))
 
     @unittest.skipUnless(
         os.environ.get("MAILCTL_RUNTIME_REPO"),
@@ -113,7 +188,7 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("Fail-closed bounded Gmail metadata access", completed.stdout)
+        self.assertIn("Fail-closed bounded mail metadata access", completed.stdout)
 
 
 if __name__ == "__main__":
