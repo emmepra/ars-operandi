@@ -48,4 +48,6 @@ After create or update, the adapter performs a separate issue read through the s
 
 Tool failures return a stable error code and a sanitized message. Runtime secrets are registered with an in-memory exact-value redactor. GraphQL error messages and response bodies are suppressed; only safe status or extension codes may be returned.
 
+Live `bootstrap` and `serve` startup also require an explicit 1Password auth mode and account selector. Ephemeral-mode signin failures use `secret_session_unavailable`; credential reads use `secret_provider_unavailable` or `secret_unavailable`. The MCP handshake starts before the one background preload, so live calls may briefly return `secret_preload_pending`; a terminal preload error is cached. None expose CLI stderr or permit another account/profile fallback.
+
 Treat these codes as hard stops: `unknown_project`, `unknown_connection`, `ambiguous_project`, `connection_not_verified`, `connection_blocked`, `workspace_identity_mismatch`, `team_identity_mismatch`, `project_identity_mismatch`, `mutations_disabled`, `mutation_confirmation_required`, `operation_not_allowed`, and `read_back_failed`.

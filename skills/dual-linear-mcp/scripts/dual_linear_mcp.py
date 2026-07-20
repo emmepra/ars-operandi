@@ -472,6 +472,96 @@ class SecretProvider(Protocol):
     def load(self, profile: str) -> str: ...
 
 
+_ONEPASSWORD_AUTH_ENV_KEYS = frozenset(
+    {
+        "OP_ACCOUNT",
+        "OP_CONNECT_HOST",
+        "OP_CONNECT_TOKEN",
+        "OP_SERVICE_ACCOUNT_TOKEN",
+        "OP_SESSION",
+    }
+)
+
+
+def _scrub_onepassword_auth_env() -> dict[str, str]:
+    """Copy the process environment without inherited 1Password auth state."""
+
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _ONEPASSWORD_AUTH_ENV_KEYS and not key.startswith("OP_SESSION_")
+    }
+
+
+class EphemeralOnePasswordSession:
+    """Acquire one app-integrated session and expose it only to child envs."""
+
+    def __init__(
+        self,
+        *,
+        account: str,
+        redactor: SecretRedactor,
+        executable: str = "op",
+        timeout_seconds: float = 20.0,
+    ) -> None:
+        if not account.strip():
+            raise AdapterError(
+                "invalid_configuration",
+                "Ephemeral 1Password auth requires an explicit account selector.",
+            )
+        self.account = account.strip()
+        self.redactor = redactor
+        self.executable = executable
+        self.timeout_seconds = timeout_seconds
+        self._token: str | None = None
+        self._failure: AdapterError | None = None
+        self._attempted = False
+        self._lock = threading.RLock()
+
+    def child_env(self) -> dict[str, str]:
+        with self._lock:
+            if self._failure is not None:
+                raise self._failure
+            if not self._attempted:
+                self._attempted = True
+                try:
+                    completed = subprocess.run(
+                        [
+                            self.executable,
+                            "signin",
+                            "--raw",
+                            "--account",
+                            self.account,
+                        ],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=self.timeout_seconds,
+                        env=_scrub_onepassword_auth_env(),
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    self._failure = AdapterError(
+                        "secret_session_unavailable",
+                        "1Password app authentication was unavailable.",
+                    )
+                    raise self._failure from exc
+                token = completed.stdout.strip()
+                if token:
+                    self.redactor.register(token)
+                if completed.returncode != 0 or not token:
+                    self._failure = AdapterError(
+                        "secret_session_unavailable",
+                        "1Password app authentication was unavailable.",
+                    )
+                    raise self._failure
+                self._token = token
+            assert self._token is not None
+            child_env = _scrub_onepassword_auth_env()
+            child_env["OP_SESSION"] = self._token
+            return child_env
+
+
 class OnePasswordSecretProvider:
     """Resolve a profile through an op:// template without shell interpolation."""
 
@@ -479,6 +569,8 @@ class OnePasswordSecretProvider:
         self,
         reference_template: str,
         *,
+        account: str,
+        session: EphemeralOnePasswordSession | None = None,
         executable: str = "op",
         timeout_seconds: float = 20.0,
     ) -> None:
@@ -487,42 +579,75 @@ class OnePasswordSecretProvider:
                 "invalid_configuration",
                 "The 1Password reference template must contain {profile}.",
             )
+        if not account.strip():
+            raise AdapterError(
+                "invalid_configuration",
+                "1Password access requires an explicit account selector.",
+            )
         self.reference_template = reference_template
+        self.account = account.strip()
+        self.session = session
         self.executable = executable
         self.timeout_seconds = timeout_seconds
+        self._failures: dict[str, AdapterError] = {}
+        self._lock = threading.RLock()
 
     def load(self, profile: str) -> str:
-        encoded_profile = urllib.parse.quote(profile, safe="")
-        reference = self.reference_template.format(profile=encoded_profile)
-        try:
-            completed = subprocess.run(
-                [self.executable, "read", reference, "--no-newline"],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=self.timeout_seconds,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise AdapterError(
-                "secret_provider_unavailable",
-                "1Password CLI could not resolve the requested credential profile.",
-                details={"credential_profile": profile},
-            ) from exc
-        if completed.returncode != 0:
-            raise AdapterError(
-                "secret_unavailable",
-                "1Password did not return the requested credential profile.",
-                details={"credential_profile": profile},
-            )
-        value = completed.stdout.strip()
-        if not value:
-            raise AdapterError(
-                "secret_unavailable",
-                "1Password returned an empty credential.",
-                details={"credential_profile": profile},
-            )
-        return value
+        with self._lock:
+            if profile in self._failures:
+                raise self._failures[profile]
+            encoded_profile = urllib.parse.quote(profile, safe="")
+            reference = self.reference_template.format(profile=encoded_profile)
+            try:
+                child_env = (
+                    self.session.child_env()
+                    if self.session is not None
+                    else _scrub_onepassword_auth_env()
+                )
+                completed = subprocess.run(
+                    [
+                        self.executable,
+                        "read",
+                        reference,
+                        "--no-newline",
+                        "--account",
+                        self.account,
+                    ],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=self.timeout_seconds,
+                    env=child_env,
+                )
+            except AdapterError:
+                raise
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                failure = AdapterError(
+                    "secret_provider_unavailable",
+                    "1Password CLI could not resolve the requested credential profile.",
+                    details={"credential_profile": profile},
+                )
+                self._failures[profile] = failure
+                raise failure from exc
+            if completed.returncode != 0:
+                failure = AdapterError(
+                    "secret_unavailable",
+                    "1Password did not return the requested credential profile.",
+                    details={"credential_profile": profile},
+                )
+                self._failures[profile] = failure
+                raise failure
+            value = completed.stdout.strip()
+            if not value:
+                failure = AdapterError(
+                    "secret_unavailable",
+                    "1Password returned an empty credential.",
+                    details={"credential_profile": profile},
+                )
+                self._failures[profile] = failure
+                raise failure
+            return value
 
 
 class MemoryCachingSecretProvider:
@@ -562,6 +687,62 @@ class MemoryCachingSecretProvider:
     def preload(self, profiles: tuple[str, ...]) -> None:
         for profile in profiles:
             self.get(profile)
+
+
+class SecretPreloadGate:
+    """Preload credentials once without delaying the MCP handshake."""
+
+    def __init__(self) -> None:
+        self._complete = threading.Event()
+        self._failure: AdapterError | None = None
+        self._started = False
+        self._lock = threading.RLock()
+
+    def start(
+        self,
+        secrets: MemoryCachingSecretProvider,
+        profiles: tuple[str, ...],
+    ) -> None:
+        with self._lock:
+            if self._started:
+                raise AdapterError(
+                    "invalid_configuration",
+                    "Credential preload may start only once per process.",
+                )
+            self._started = True
+
+        def preload() -> None:
+            try:
+                secrets.preload(profiles)
+            except AdapterError as exc:
+                self._failure = exc
+            except Exception:
+                self._failure = AdapterError(
+                    "secret_preload_failed",
+                    "Credential preload failed without exposing runtime details.",
+                )
+            finally:
+                self._complete.set()
+
+        threading.Thread(
+            target=preload,
+            name="dual-linear-secret-preload",
+            daemon=True,
+        ).start()
+
+    def require_ready(self) -> None:
+        if not self._complete.is_set():
+            raise AdapterError(
+                "secret_preload_pending",
+                "Credential preload is still in progress; retry this read-only call shortly.",
+            )
+        if self._failure is not None:
+            raise self._failure
+
+    def wait(self, timeout: float) -> bool:
+        """Wait for tests and local smoke orchestration, never for tool fallback."""
+
+        return self._complete.wait(timeout)
 
 
 @dataclass(frozen=True)
@@ -903,12 +1084,14 @@ class AdapterService:
         transport: LinearTransport,
         mutations_enabled: bool,
         redactor: SecretRedactor,
+        preload_gate: SecretPreloadGate | None = None,
     ) -> None:
         self.manifest = manifest
         self.secrets = secrets
         self.transport = transport
         self.mutation_policy = MutationPolicy(enabled=mutations_enabled)
         self.redactor = redactor
+        self.preload_gate = preload_gate
 
     def _transport_call(
         self,
@@ -930,6 +1113,8 @@ class AdapterService:
         project: str | None,
         connection_alias: str | None,
     ) -> tuple[ResolvedRoute, str, WorkspaceIdentity]:
+        if self.preload_gate is not None:
+            self.preload_gate.require_ready()
         route = self.manifest.resolve(
             project=project, connection_alias=connection_alias
         )
@@ -1382,6 +1567,15 @@ def _add_provider_arguments(parser: argparse.ArgumentParser) -> None:
         help="Non-secret op:// URI template containing {profile}.",
     )
     parser.add_argument("--op-executable", default="op")
+    parser.add_argument(
+        "--op-auth-mode",
+        choices=("ephemeral", "direct"),
+        help="Explicit 1Password auth mode; ephemeral signs in once per process.",
+    )
+    parser.add_argument(
+        "--op-account",
+        help="Explicit non-secret 1Password account selector.",
+    )
     parser.add_argument("--linear-endpoint", default=LINEAR_ENDPOINT)
     parser.add_argument(
         "--auth-scheme", choices=("api-key", "bearer"), default="api-key"
@@ -1424,8 +1618,25 @@ def main(argv: list[str] | None = None) -> int:
                 "invalid_configuration",
                 "This command requires --op-reference-template or DUAL_LINEAR_OP_REFERENCE_TEMPLATE.",
             )
+        if not args.op_auth_mode or not args.op_account or not args.op_account.strip():
+            raise AdapterError(
+                "invalid_configuration",
+                "This command requires explicit --op-auth-mode and --op-account values.",
+            )
+        session = (
+            EphemeralOnePasswordSession(
+                account=args.op_account,
+                redactor=redactor,
+                executable=args.op_executable,
+                timeout_seconds=args.timeout_seconds,
+            )
+            if args.op_auth_mode == "ephemeral"
+            else None
+        )
         backend = OnePasswordSecretProvider(
             args.op_reference_template,
+            account=args.op_account,
+            session=session,
             executable=args.op_executable,
             timeout_seconds=args.timeout_seconds,
         )
@@ -1473,15 +1684,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
-        secrets.preload(manifest.verified_credential_profiles())
+        preload_gate = SecretPreloadGate()
         service = AdapterService(
             manifest=manifest,
             secrets=secrets,
             transport=transport,
             mutations_enabled=args.enable_mutations,
             redactor=redactor,
+            preload_gate=preload_gate,
         )
-        build_mcp(service).run(transport="stdio")
+        server = build_mcp(service)
+        preload_gate.start(secrets, manifest.verified_credential_profiles())
+        server.run(transport="stdio")
         return 0
     except AdapterError as exc:
         print(

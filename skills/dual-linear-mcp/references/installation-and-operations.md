@@ -2,20 +2,24 @@
 
 ## Prerequisites
 
-- `uv` for the script-scoped Python environment.
-- 1Password CLI authenticated in the same host/session context that starts the MCP process.
-- One 1Password secret item per manifest `credential_profile`.
-- A non-secret `op://` template containing `{profile}`, for example `op://Operations/{profile}/api-key`.
+- `codex`, `uv`, and 1Password CLI (`op`) on the same Mac.
+- 1Password desktop integration enabled for the selected account.
+- An explicit consumer manifest path.
+- One 1Password item per manifest `credential_profile`, under one deterministic non-secret template such as `op://Example/{profile}/credential`.
 
-The server uses `op read` without a shell. It preloads every verified profile at process start and caches secret values only in memory. Startup fails if any verified profile cannot be loaded. Restart the MCP server after credential rotation or re-authentication.
+Use a concealed `credential` field and item titles that match the manifest profiles. The manifest, installer arguments, and Codex config contain only paths, aliases, an account selector, and the `op://` template—never a Linear token or 1Password session.
 
-Linear personal API keys use the default `--auth-scheme api-key`. For OAuth access tokens, start with `--auth-scheme bearer`.
+## Ephemeral 1Password bootstrap
 
-The URI template is one deterministic mapping, so the selected items must share a vault and field shape. A common setup uses item titles equal to each `credential_profile` and one concealed `credential` field. Do not put a token in an environment variable, manifest, command argument, or config file.
+For Codex-launched live processes, select `--op-auth-mode ephemeral` and an explicit `--op-account`. At first credential load the adapter runs exactly one `op signin --raw --account <selector>`. It captures stdout without a shell, registers the session with the in-memory redactor, and supplies it to subsequent `op read` children only as `OP_SESSION` in a private environment.
 
-## Validate without installing
+Both signin and read children start from an environment with inherited `OP_SESSION*`, `OP_ACCOUNT`, `OP_SERVICE_ACCOUNT_TOKEN`, `OP_CONNECT_TOKEN`, and `OP_CONNECT_HOST` removed. The parent environment is never mutated. Signin, timeout, empty-session, or read failure is terminal for that process/profile: there is no retry, re-signin, ambient-session fallback, or credential switching.
 
-The safe dry run is the credential-free manifest and route check:
+`--op-auth-mode direct` is an explicit diagnostic alternative. It also strips inherited 1Password auth and requires `--op-account`, but invokes `op read` directly. Do not configure either mode with a session or provider token in Codex.
+
+## Validate before installation
+
+These checks are credential-free:
 
 ```bash
 uv run --script /absolute/path/to/dual_linear_mcp.py validate-manifest \
@@ -26,82 +30,93 @@ uv run --script /absolute/path/to/dual_linear_mcp.py resolve \
   --connection-alias linear-alpha
 ```
 
-There is intentionally no mutation dry-run that pretends a write occurred. The MCP server is read-only by default because mutation handlers reject calls unless `--enable-mutations` is present.
+## Idempotent skill and MCP installation
 
-## Bootstrap planned connections
+The installer copies the skill to `~/.agents/skills/dual-linear-mcp` and registers one read-only-by-default STDIO MCP alias: `dual-linear`. It does not symlink a worktree. Its default is dry-run; `--apply` is required for changes.
 
-Bootstrap is a read-only CLI path for a consumer manifest whose connections do not yet have stable workspace IDs:
+During apply, the installer runs a credential-free manifest validation once to prepare the `uv` environment. The registered MCP uses `uv run --offline`, so dependency resolution cannot consume Codex's startup window. Installer calls to `codex mcp` also set a non-secret wrapper-bypass flag and remove inherited 1Password auth, preventing an unrelated shell wrapper from opening a second signin.
+
+Run the exact command once without `--apply`, review the JSON actions, then repeat it with `--apply`:
 
 ```bash
-uv run --script /absolute/path/to/dual_linear_mcp.py bootstrap \
+python3 /absolute/path/to/ars-operandi/skills/dual-linear-mcp/scripts/install_dual_linear.py install \
+  --manifest /absolute/path/to/projects.yaml \
+  --op-reference-template 'op://Example/{profile}/credential' \
+  --op-account example
+
+python3 /absolute/path/to/ars-operandi/skills/dual-linear-mcp/scripts/install_dual_linear.py install \
+  --manifest /absolute/path/to/projects.yaml \
+  --op-reference-template 'op://Example/{profile}/credential' \
+  --op-account example \
+  --apply
+```
+
+The installed MCP command is exactly the following non-secret shape:
+
+```text
+uv run --offline --script ~/.agents/skills/dual-linear-mcp/scripts/dual_linear_mcp.py serve
+  --manifest /absolute/path/to/projects.yaml
+  --op-reference-template op://Example/{profile}/credential
+  --op-auth-mode ephemeral
+  --op-account example
+  --auth-scheme api-key
+```
+
+The installer records a content hash and managed marker inside the copied skill. Repeating the same desired state is a no-op. A locally modified managed copy, an unmanaged destination, or a `dual-linear` MCP config that differs from the recorded state fails closed; nothing is silently overwritten. The installer never prints another MCP configuration.
+
+The server begins its STDIO handshake before credential preload. Preload still runs exactly once per process; live tools return `secret_preload_pending` until it finishes, then either use the memory cache or fail with the cached redacted auth error. This avoids Codex's startup timeout without persisting a session or deferring identity checks.
+
+## Post-install config and runtime smoke
+
+First run the credential-free managed-install smoke. Its verdict is only `config-verified`: it checks the managed hash, exact MCP registration, and prepared offline runtime, not a Linear workspace.
+
+```bash
+python3 ~/.agents/skills/dual-linear-mcp/scripts/install_dual_linear.py smoke
+codex mcp get dual-linear --json
+```
+
+Then restart the MCP from Codex desktop under **Settings > MCP servers > Restart** and inspect `/mcp`. If the skill is absent or stale, restart or refresh the Codex task/app so skill discovery reruns.
+
+For two `planned` connections, run one read-only identity bootstrap with both explicit public-style aliases:
+
+```bash
+uv run --script ~/.agents/skills/dual-linear-mcp/scripts/dual_linear_mcp.py bootstrap \
   --manifest /absolute/path/to/projects.yaml \
   --connection-alias linear-alpha \
   --connection-alias linear-beta \
-  --op-reference-template 'op://Operations/{profile}/credential'
+  --op-reference-template 'op://Example/{profile}/credential' \
+  --op-auth-mode ephemeral \
+  --op-account example
 ```
 
-Every alias is explicit. The process preloads only the selected credentials, discovers each workspace and its teams, and emits a candidate `expected_workspace_id`; it does not edit the manifest or make a planned route callable. A consumer owner must compare the returned identity with an independent trusted account view before recording the stable ID and changing `binding_state` to `verified`. Rerun bootstrap after that change: an ID mismatch then fails closed.
-
-## Add a read-only Codex STDIO server
-
-Review the command before running it; this changes Codex MCP configuration but does not install Python packages globally:
+Compare each returned stable workspace/team identity with an independent trusted account view. Bootstrap never edits the manifest. After the consumer owner records both stable IDs and changes both bindings to `verified`, run the exact MCP handshake/list-tools/two-workspace smoke:
 
 ```bash
-codex mcp add dual-linear -- \
-  uv run --script /absolute/path/to/dual_linear_mcp.py serve \
-  --manifest /absolute/path/to/projects.yaml \
-  --op-reference-template 'op://Operations/{profile}/api-key'
+uv run --script ~/.agents/skills/dual-linear-mcp/scripts/smoke_dual_linear_mcp.py \
+  --connection-alias linear-alpha \
+  --connection-alias linear-beta
 ```
 
-For project-scoped configuration in a trusted repository, use this generic `.codex/config.toml` shape:
+This command launches the exact registered read-only STDIO command, waits only while the one process-local credential preload is pending, lists the MCP tools, and invokes `linear_discover` once per explicit alias. Success is `runtime-verified` with two independently matched workspace IDs. Auth, identity, unknown-alias, or tool-contract failures stop without fallback. Finally restart `dual-linear` in Codex and repeat the two `linear_discover` calls from the refreshed task to prove client-side discovery.
 
-```toml
-[mcp_servers.dual_linear]
-command = "uv"
-args = [
-  "run",
-  "--script",
-  "/absolute/path/to/dual_linear_mcp.py",
-  "serve",
-  "--manifest",
-  "/absolute/path/to/projects.yaml",
-  "--op-reference-template",
-  "op://Operations/{profile}/api-key",
-]
-required = true
-enabled_tools = [
-  "resolve_linear_route",
-  "linear_discover",
-  "linear_get_issue",
-]
-default_tools_approval_mode = "writes"
+## Mutation gate
+
+The installed config intentionally omits `--enable-mutations`. Do not add it without separate approval for the target workspace and operation. A write still requires `confirm=true`, identity preflight, and read-back. There is no delete/archive cleanup tool in this version.
+
+## Rollback
+
+Rollback is also dry-run-first and removes only state that matches the installer marker and recorded MCP config:
+
+```bash
+python3 ~/.agents/skills/dual-linear-mcp/scripts/install_dual_linear.py rollback
+python3 ~/.agents/skills/dual-linear-mcp/scripts/install_dual_linear.py rollback --apply
 ```
 
-Configure the MCP server only after all intended bindings are `verified`. Restart the Codex client after configuration, then inspect the server with `codex mcp list` or `/mcp`. Use discovery with each connection and compare the returned workspace/team IDs with the intended manifest binding before enabling any mutation.
-
-## Temporarily enable mutations
-
-Do this only under explicit approval for the target workspace and operation:
-
-1. Add `--enable-mutations` to the server arguments.
-2. Add only `linear_create_issue` and/or `linear_update_issue` to the client `enabled_tools` list.
-3. Restart the server so secrets are freshly loaded.
-4. Run `linear_discover` first.
-5. Call the mutation with one project or connection selector and `confirm=true`.
-6. Require `verification: read-back-verified` before treating the operation as complete.
-7. Remove mutation enablement after the approved operation window.
-
-## Rollback and removal
-
-- Disable the config entry with `enabled = false`, or remove it with `codex mcp remove dual-linear`.
-- Restart Codex to terminate the process and clear the in-memory secret cache.
-- Remove the project-scoped configuration block if one was added.
-- Removing the adapter does not change the manifest, 1Password items, or Linear data.
-- If a mutation succeeded but read-back failed, inspect that one workspace manually before retrying. Do not retry through another credential.
+After rollback, restart/refresh Codex to terminate the old STDIO process and clear its in-memory cache. Rollback does not change the consumer manifest, 1Password items, or Linear data. If either installed surface has drifted, rollback stops for operator review.
 
 ## Upstream references
 
 - [Linear GraphQL getting started](https://linear.app/developers/graphql)
 - [1Password CLI secret loading](https://developer.1password.com/docs/cli/secrets-scripts)
 - [Official MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
-- [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp)
+- [Codex MCP configuration](https://developers.openai.com/codex/mcp/)

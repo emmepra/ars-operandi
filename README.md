@@ -23,15 +23,16 @@ the mail surface or installation contract.
 
 ## Usage
 
-Copy or install the relevant skill folder into your Codex skills directory, or keep this repository available as a shared source for agent skill sync.
+Copy a skill folder into the user skill directory, or use a skill-specific installer when one is provided.
 
 ```bash
 cp -R skills/railway-deploy ~/.codex/skills/
 cp -R skills/codex-thread-manager ~/.codex/skills/
 cp -R skills/mailctl-email-access ~/.codex/skills/
-cp -R skills/dual-linear-mcp ~/.codex/skills/
 cp -R skills/openrouter-ops ~/.codex/skills/
 ```
+
+`dual-linear-mcp` includes a dry-run-first installer that also manages the fixed `dual-linear` MCP alias. See its [installation reference](skills/dual-linear-mcp/references/installation-and-operations.md); do not manually copy it and separately register a competing config.
 
 Invoke explicitly when needed:
 
