@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -17,10 +19,14 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
         required_markers = (
             "consumer-provided `mailctl`",
             "sole Gmail runtime",
+            "<runtime-repo>",
+            "<provider>",
+            "Proceed only when `<provider>` is exactly `gmail`",
+            "no cross-provider fallback",
             "--project-index \"<project-index>\"",
             "--config-root \"<config-root>\"",
             "--account \"<alias>\"",
-            "mailctl status --account \"<alias>\"",
+            "uv run --project \"<runtime-repo>\" mailctl status --account \"<alias>\"",
             "gws auth login --readonly --services gmail",
             "users.getProfile",
             "users.messages.list",
@@ -44,6 +50,19 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
 
         self.assertRegex(text, r"(?m)^description: Use when ")
 
+        command_lines = tuple(
+            line.strip()
+            for line in text.splitlines()
+            if line.strip().startswith(("mailctl ", "uv run "))
+        )
+        self.assertTrue(command_lines)
+        for line in command_lines:
+            with self.subTest(command=line):
+                self.assertTrue(
+                    line.startswith('uv run --project "<runtime-repo>" mailctl '),
+                    line,
+                )
+
     def test_skill_has_no_second_runner_or_private_consumer_data(self) -> None:
         text = SKILL_PATH.read_text(encoding="utf-8")
         lowered = text.lower()
@@ -64,6 +83,37 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
                 self.assertNotIn(forbidden, lowered)
 
         self.assertIsNone(re.search(r"\b(personal|sapienza|icaro)\b", lowered))
+
+    @unittest.skipUnless(
+        os.environ.get("MAILCTL_RUNTIME_REPO"),
+        "set MAILCTL_RUNTIME_REPO for the external-cwd forward test",
+    )
+    def test_explicit_runtime_project_invocation_works_from_external_cwd(self) -> None:
+        runtime_repo = Path(os.environ["MAILCTL_RUNTIME_REPO"]).expanduser().resolve()
+        external_cwd = Path(
+            os.environ.get("MAILCTL_FORWARD_TEST_CWD", str(REPO_ROOT.parent))
+        ).expanduser().resolve()
+
+        self.assertTrue((runtime_repo / "pyproject.toml").is_file())
+        self.assertTrue(external_cwd.is_dir())
+        completed = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--project",
+                str(runtime_repo),
+                "mailctl",
+                "--help",
+            ],
+            cwd=external_cwd,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Fail-closed bounded Gmail metadata access", completed.stdout)
 
 
 if __name__ == "__main__":
