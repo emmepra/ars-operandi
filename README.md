@@ -15,6 +15,11 @@ It complements Ora et Labora. Ora et Labora defines the repo-first workflow: iss
 
 Future adapters may cover Cloudflare, Hetzner, Docker Compose VPS, Tailscale, Resend, and other operational surfaces.
 
+Ars Operandi is the durable owner of the public mail operating surface. Until a
+separate atomic cutover transfers the runtime and tests here, Workflow Agent is
+only the transitional `mailctl` source; none of its other subsystems are part of
+the mail surface or installation contract.
+
 ## Usage
 
 Copy or install the relevant skill folder into your Codex skills directory, or keep this repository available as a shared source for agent skill sync.
