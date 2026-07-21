@@ -1,0 +1,6 @@
+interface:
+  display_name: "Dual Linear MCP"
+  short_description: "Route Linear operations without account drift"
+  default_prompt: "Use $dual-linear-mcp to resolve a project to one verified Linear connection and fail closed on identity or read-back mismatches."
+policy:
+  allow_implicit_invocation: true
