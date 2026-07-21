@@ -337,6 +337,87 @@ class SecretAndIdentityTests(unittest.TestCase):
             child_env = call["env"]
             self.assertEqual(child_env["OP_SESSION"], session_token)
 
+    def test_direct_app_integration_skips_signin_and_scrubs_read_env(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def fake_run(
+            command: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append({"command": command, **kwargs})
+            self.assertEqual(command[1], "read")
+            profile = "alpha" if "credential-alpha" in command[2] else "beta"
+            return subprocess.CompletedProcess(
+                command, 0, f"linear-token-{profile}", ""
+            )
+
+        provider = dual_linear_mcp.OnePasswordSecretProvider(
+            "op://Sample/{profile}/api-key",
+            account="example",
+        )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PATH": "/usr/bin",
+                    "OP_SESSION": "ambient-session",
+                    "OP_SERVICE_ACCOUNT_TOKEN": "ambient-service-token",
+                },
+                clear=True,
+            ),
+            mock.patch.object(dual_linear_mcp.subprocess, "run", side_effect=fake_run),
+        ):
+            self.assertEqual(provider.load("credential-alpha"), "linear-token-alpha")
+            self.assertEqual(provider.load("credential-beta"), "linear-token-beta")
+            self.assertEqual(os.environ["OP_SESSION"], "ambient-session")
+
+        read_calls = [call for call in calls if call["command"][1] == "read"]
+        self.assertFalse(any(call["command"][1] == "signin" for call in calls))
+        self.assertEqual(len(read_calls), 2)
+        for call in read_calls:
+            self.assertEqual(call["env"], {"PATH": "/usr/bin"})
+            self.assertEqual(call["command"][-2:], ["--account", "example"])
+
+    def test_direct_bulk_preload_uses_one_inject_without_secret_argv_or_env(
+        self,
+    ) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="0:token-alpha\n1:token-beta\n", stderr=""
+        )
+        provider = dual_linear_mcp.OnePasswordSecretProvider(
+            "op://Sample/{profile}/api-key",
+            account="example",
+        )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"PATH": "/usr/bin", "OP_SESSION": "ambient-session"},
+                clear=True,
+            ),
+            mock.patch.object(
+                dual_linear_mcp.subprocess, "run", return_value=completed
+            ) as run,
+        ):
+            values = provider.load_many(("credential-alpha", "credential-beta"))
+
+        self.assertEqual(
+            values,
+            {
+                "credential-alpha": "token-alpha",
+                "credential-beta": "token-beta",
+            },
+        )
+        self.assertEqual(
+            run.call_args.args[0], ["op", "inject", "--account", "example"]
+        )
+        self.assertEqual(run.call_args.kwargs["env"], {"PATH": "/usr/bin"})
+        template = run.call_args.kwargs["input"]
+        self.assertIn("op://Sample/credential-alpha/api-key", template)
+        self.assertIn("op://Sample/credential-beta/api-key", template)
+        self.assertNotIn("token-alpha", template)
+        self.assertNotIn("token-beta", template)
+
     def test_ephemeral_auth_scrubs_inherited_auth_from_signin_and_read(self) -> None:
         inherited = {
             "PATH": "/usr/bin",
@@ -412,6 +493,34 @@ class SecretAndIdentityTests(unittest.TestCase):
                 self.assertNotIn("sensitive stderr", str(caught.exception))
                 self.assertEqual(run.call_count, 1)
 
+    def test_ephemeral_nonzero_empty_signin_fails_without_read(self) -> None:
+        completed = subprocess.CompletedProcess([], 1, "", "private stderr")
+        redactor = dual_linear_mcp.SecretRedactor()
+        session = dual_linear_mcp.EphemeralOnePasswordSession(
+            account="example",
+            redactor=redactor,
+        )
+        provider = dual_linear_mcp.OnePasswordSecretProvider(
+            "op://Sample/{profile}/api-key",
+            account="example",
+            session=session,
+        )
+
+        with mock.patch.object(
+            dual_linear_mcp.subprocess, "run", return_value=completed
+        ) as run:
+            for _ in range(2):
+                with self.assertRaises(dual_linear_mcp.AdapterError) as caught:
+                    provider.load("credential-alpha")
+                self.assertEqual(caught.exception.code, "secret_session_unavailable")
+                self.assertEqual(
+                    str(caught.exception),
+                    "Unlock the 1Password desktop app, then restart this MCP server.",
+                )
+                self.assertNotIn("private stderr", str(caught.exception))
+
+        self.assertEqual(run.call_count, 1)
+
     def test_failed_signin_stdout_is_registered_for_redaction(self) -> None:
         session_token = "failed-session-token"
         completed = subprocess.CompletedProcess([], 1, session_token, "private stderr")
@@ -457,6 +566,10 @@ class SecretAndIdentityTests(unittest.TestCase):
                 with self.assertRaises(dual_linear_mcp.AdapterError) as caught:
                     provider.load("credential-alpha")
                 self.assertEqual(caught.exception.code, "secret_unavailable")
+                self.assertEqual(
+                    str(caught.exception),
+                    "Unlock the 1Password desktop app, then restart this MCP server.",
+                )
                 self.assertNotIn("private read stderr", str(caught.exception))
 
         self.assertEqual(run.call_count, 2)
@@ -741,6 +854,74 @@ class MutationGuardTests(unittest.TestCase):
 
 
 class McpContractTests(unittest.TestCase):
+    def test_direct_mcp_preload_reads_profiles_once_then_tools_use_only_memory(
+        self,
+    ) -> None:
+        calls: list[dict[str, object]] = []
+
+        def fake_run(
+            command: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append({"command": command, **kwargs})
+            self.assertEqual(command[1], "inject")
+            return subprocess.CompletedProcess(
+                command, 0, "0:token-alpha\n1:token-beta\n", ""
+            )
+
+        manifest = dual_linear_mcp.Manifest.load(FIXTURE)
+        redactor = dual_linear_mcp.SecretRedactor()
+        backend = dual_linear_mcp.OnePasswordSecretProvider(
+            "op://Sample/{profile}/api-key",
+            account="example",
+        )
+        secrets = dual_linear_mcp.MemoryCachingSecretProvider(backend, redactor)
+        gate = dual_linear_mcp.SecretPreloadGate()
+        service = dual_linear_mcp.AdapterService(
+            manifest=manifest,
+            secrets=secrets,
+            transport=FakeLinearTransport(),
+            mutations_enabled=False,
+            redactor=redactor,
+            preload_gate=gate,
+        )
+        server = dual_linear_mcp.build_mcp(service)
+
+        async def call_discovery_tools() -> None:
+            for project in ("sample-alpha", "sample-beta", "sample-alpha"):
+                result = await server.call_tool("linear_discover", {"project": project})
+                payload = result[1]
+                self.assertTrue(payload["ok"])
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PATH": "/usr/bin",
+                    "OP_SESSION": "ambient-session",
+                    "OP_SERVICE_ACCOUNT_TOKEN": "ambient-service-token",
+                },
+                clear=True,
+            ),
+            mock.patch.object(dual_linear_mcp.subprocess, "run", side_effect=fake_run),
+        ):
+            gate.start(secrets, manifest.verified_credential_profiles())
+            self.assertTrue(gate.wait(timeout=1))
+            gate.require_ready()
+            preload_call_count = len(calls)
+            asyncio.run(call_discovery_tools())
+
+        self.assertFalse(any(call["command"][1] == "signin" for call in calls))
+        self.assertFalse(any(call["command"][1] == "read" for call in calls))
+        self.assertEqual(preload_call_count, 1)
+        self.assertEqual(len(calls), preload_call_count)
+        self.assertEqual(calls[0]["command"], ["op", "inject", "--account", "example"])
+        for call in calls:
+            self.assertEqual(call["env"], {"PATH": "/usr/bin"})
+            self.assertNotIn("token-alpha", call["command"])
+            self.assertNotIn("token-beta", call["command"])
+            self.assertIn("op://Sample/credential-alpha/api-key", call["input"])
+            self.assertIn("op://Sample/credential-beta/api-key", call["input"])
+
     def test_mcp_exposes_only_the_allowlisted_tools_with_annotations(self) -> None:
         service, _, _ = build_service()
         server = dual_linear_mcp.build_mcp(service)

@@ -208,7 +208,7 @@ def _desired_config(
                 "--op-reference-template",
                 reference_template,
                 "--op-auth-mode",
-                "ephemeral",
+                "direct",
                 "--op-account",
                 account,
                 "--auth-scheme",

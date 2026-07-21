@@ -9,13 +9,13 @@
 
 Use a concealed `credential` field and item titles that match the manifest profiles. The manifest, installer arguments, and Codex config contain only paths, aliases, an account selector, and the `op://` template—never a Linear token or 1Password session.
 
-## Ephemeral 1Password bootstrap
+## 1Password desktop integration
 
-For Codex-launched live processes, select `--op-auth-mode ephemeral` and an explicit `--op-account`. At first credential load the adapter runs exactly one `op signin --raw --account <selector>`. It captures stdout without a shell, registers the session with the in-memory redactor, and supplies it to subsequent `op read` children only as `OP_SESSION` in a private environment.
+For Codex-launched live processes, select `--op-auth-mode direct` and an explicit `--op-account`. With 1Password desktop app integration enabled, one `op inject --account <selector>` resolves all required profiles from an in-memory stdin template. The adapter does not call `op signin`, create a shell session, write a resolved template to disk, or place an `OP_SESSION` in Codex configuration.
 
-Both signin and read children start from an environment with inherited `OP_SESSION*`, `OP_ACCOUNT`, `OP_SERVICE_ACCOUNT_TOKEN`, `OP_CONNECT_TOKEN`, and `OP_CONNECT_HOST` removed. The parent environment is never mutated. Signin, timeout, empty-session, or read failure is terminal for that process/profile: there is no retry, re-signin, ambient-session fallback, or credential switching.
+The inject child starts from an environment with inherited `OP_SESSION*`, `OP_ACCOUNT`, `OP_SERVICE_ACCOUNT_TOKEN`, `OP_CONNECT_TOKEN`, and `OP_CONNECT_HOST` removed. The parent environment is never mutated. Timeout, malformed bundle, or provider failure is terminal for that process: there is no retry, signin, ambient-session fallback, or credential switching.
 
-`--op-auth-mode direct` is an explicit diagnostic alternative. It also strips inherited 1Password auth and requires `--op-account`, but invokes `op read` directly. Do not configure either mode with a session or provider token in Codex.
+`--op-auth-mode ephemeral` remains an explicit compatibility alternative for environments that deliberately use a short-lived `op signin --raw` session. It is not installed by default. Do not configure either mode with a session or provider token in Codex.
 
 ## Validate before installation
 
@@ -57,14 +57,16 @@ The installed MCP command is exactly the following non-secret shape:
 uv run --offline --script ~/.agents/skills/dual-linear-mcp/scripts/dual_linear_mcp.py serve
   --manifest /absolute/path/to/projects.yaml
   --op-reference-template op://Example/{profile}/credential
-  --op-auth-mode ephemeral
+  --op-auth-mode direct
   --op-account example
   --auth-scheme api-key
 ```
 
 The installer records a content hash and managed marker inside the copied skill. Repeating the same desired state is a no-op. A locally modified managed copy, an unmanaged destination, or a `dual-linear` MCP config that differs from the recorded state fails closed; nothing is silently overwritten. The installer never prints another MCP configuration.
 
-The server begins its STDIO handshake before credential preload. Preload still runs exactly once per process; live tools return `secret_preload_pending` until it finishes, then either use the memory cache or fail with the cached redacted auth error. This avoids Codex's startup timeout without persisting a session or deferring identity checks.
+The server starts one credential preload in a background thread without waiting for it before serving the STDIO transport. Direct desktop integration performs no signin and resolves every distinct verified profile through one `op inject` process into the memory cache. After preload succeeds, repeated MCP tool calls make no additional 1Password calls and cannot create prompt loops.
+
+Live tools return `secret_preload_pending` until preload finishes. A locked or unavailable desktop app, desktop authorization failure, or profile read failure is cached for the process and fails closed with one sanitized instruction to unlock 1Password and restart the MCP server. This keeps interactive authentication off the blocking startup path without persisting a session or deferring identity checks.
 
 ## Post-install config and runtime smoke
 
@@ -85,7 +87,7 @@ uv run --script ~/.agents/skills/dual-linear-mcp/scripts/dual_linear_mcp.py boot
   --connection-alias linear-alpha \
   --connection-alias linear-beta \
   --op-reference-template 'op://Example/{profile}/credential' \
-  --op-auth-mode ephemeral \
+  --op-auth-mode direct \
   --op-account example
 ```
 

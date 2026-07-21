@@ -482,6 +482,10 @@ _ONEPASSWORD_AUTH_ENV_KEYS = frozenset(
     }
 )
 
+_ONEPASSWORD_UNLOCK_MESSAGE = (
+    "Unlock the 1Password desktop app, then restart this MCP server."
+)
+
 
 def _scrub_onepassword_auth_env() -> dict[str, str]:
     """Copy the process environment without inherited 1Password auth state."""
@@ -494,7 +498,7 @@ def _scrub_onepassword_auth_env() -> dict[str, str]:
 
 
 class EphemeralOnePasswordSession:
-    """Acquire one app-integrated session and expose it only to child envs."""
+    """Acquire one explicit session and expose it only to child environments."""
 
     def __init__(
         self,
@@ -543,7 +547,7 @@ class EphemeralOnePasswordSession:
                 except (OSError, subprocess.TimeoutExpired) as exc:
                     self._failure = AdapterError(
                         "secret_session_unavailable",
-                        "1Password app authentication was unavailable.",
+                        _ONEPASSWORD_UNLOCK_MESSAGE,
                     )
                     raise self._failure from exc
                 token = completed.stdout.strip()
@@ -552,7 +556,7 @@ class EphemeralOnePasswordSession:
                 if completed.returncode != 0 or not token:
                     self._failure = AdapterError(
                         "secret_session_unavailable",
-                        "1Password app authentication was unavailable.",
+                        _ONEPASSWORD_UNLOCK_MESSAGE,
                     )
                     raise self._failure
                 self._token = token
@@ -592,12 +596,15 @@ class OnePasswordSecretProvider:
         self._failures: dict[str, AdapterError] = {}
         self._lock = threading.RLock()
 
+    def _reference(self, profile: str) -> str:
+        encoded_profile = urllib.parse.quote(profile, safe="")
+        return self.reference_template.format(profile=encoded_profile)
+
     def load(self, profile: str) -> str:
         with self._lock:
             if profile in self._failures:
                 raise self._failures[profile]
-            encoded_profile = urllib.parse.quote(profile, safe="")
-            reference = self.reference_template.format(profile=encoded_profile)
+            reference = self._reference(profile)
             try:
                 child_env = (
                     self.session.child_env()
@@ -633,7 +640,11 @@ class OnePasswordSecretProvider:
             if completed.returncode != 0:
                 failure = AdapterError(
                     "secret_unavailable",
-                    "1Password did not return the requested credential profile.",
+                    (
+                        _ONEPASSWORD_UNLOCK_MESSAGE
+                        if self.session is not None
+                        else "1Password did not return the requested credential profile."
+                    ),
                     details={"credential_profile": profile},
                 )
                 self._failures[profile] = failure
@@ -648,6 +659,67 @@ class OnePasswordSecretProvider:
                 self._failures[profile] = failure
                 raise failure
             return value
+
+    def load_many(self, profiles: tuple[str, ...]) -> dict[str, str]:
+        """Resolve multiple profiles through one app-authorized `op inject` call."""
+
+        unique_profiles = tuple(dict.fromkeys(profiles))
+        if not unique_profiles:
+            return {}
+        template = "".join(
+            f"{index}:{{{{ {self._reference(profile)} }}}}\n"
+            for index, profile in enumerate(unique_profiles)
+        )
+        try:
+            child_env = (
+                self.session.child_env()
+                if self.session is not None
+                else _scrub_onepassword_auth_env()
+            )
+            completed = subprocess.run(
+                [
+                    self.executable,
+                    "inject",
+                    "--account",
+                    self.account,
+                ],
+                input=template,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=self.timeout_seconds,
+                env=child_env,
+            )
+        except AdapterError:
+            raise
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AdapterError(
+                "secret_provider_unavailable",
+                "1Password CLI could not preload the requested credential profiles.",
+            ) from exc
+        if completed.returncode != 0:
+            raise AdapterError(
+                "secret_unavailable",
+                _ONEPASSWORD_UNLOCK_MESSAGE,
+            )
+        lines = completed.stdout.splitlines()
+        if len(lines) != len(unique_profiles):
+            raise AdapterError(
+                "secret_unavailable",
+                "1Password returned an invalid credential bundle.",
+            )
+        values: dict[str, str] = {}
+        for index, (profile, line) in enumerate(zip(unique_profiles, lines)):
+            prefix = f"{index}:"
+            if not line.startswith(prefix) or not line[len(prefix) :]:
+                raise AdapterError(
+                    "secret_unavailable",
+                    "1Password returned an invalid credential bundle.",
+                    details={"credential_profile": profile},
+                )
+            values[profile] = line[len(prefix) :]
+        return values
 
 
 class MemoryCachingSecretProvider:
@@ -685,8 +757,42 @@ class MemoryCachingSecretProvider:
             return value
 
     def preload(self, profiles: tuple[str, ...]) -> None:
-        for profile in profiles:
-            self.get(profile)
+        unique_profiles = tuple(dict.fromkeys(profiles))
+        with self._lock:
+            missing = tuple(
+                profile for profile in unique_profiles if profile not in self._cache
+            )
+            if not missing:
+                return
+            bulk_load = getattr(self.backend, "load_many", None)
+            if not callable(bulk_load):
+                for profile in missing:
+                    self.get(profile)
+                return
+            try:
+                values = bulk_load(missing)
+            except AdapterError:
+                raise
+            except Exception as exc:
+                raise AdapterError(
+                    "secret_unavailable",
+                    "The credential provider failed without exposing runtime details.",
+                ) from exc
+            if set(values) != set(missing):
+                raise AdapterError(
+                    "secret_unavailable",
+                    "The credential provider returned an incomplete credential bundle.",
+                )
+            for profile in missing:
+                value = values[profile]
+                if not isinstance(value, str) or not value:
+                    raise AdapterError(
+                        "secret_unavailable",
+                        "The credential provider returned an empty credential.",
+                        details={"credential_profile": profile},
+                    )
+                self.redactor.register(value)
+                self._cache[profile] = value
 
 
 class SecretPreloadGate:
@@ -1570,7 +1676,10 @@ def _add_provider_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--op-auth-mode",
         choices=("ephemeral", "direct"),
-        help="Explicit 1Password auth mode; ephemeral signs in once per process.",
+        help=(
+            "Explicit 1Password auth mode; direct uses desktop app integration "
+            "without calling op signin."
+        ),
     )
     parser.add_argument(
         "--op-account",

@@ -46,6 +46,15 @@ args = sys.argv[1:]
 if args[0] == "signin":
     print("ephemeral-session")
     raise SystemExit(0)
+if args[0] == "inject":
+    template = sys.stdin.read()
+    output = template.replace(
+        "{{ op://Sample/credential-alpha/api-key }}", "token-alpha"
+    ).replace(
+        "{{ op://Sample/credential-beta/api-key }}", "token-beta"
+    )
+    print(output, end="")
+    raise SystemExit(0)
 if args[0] == "read":
     print("token-alpha" if "credential-alpha" in args[1] else "token-beta")
     raise SystemExit(0)
@@ -124,7 +133,7 @@ class RuntimeSmokeTests(unittest.TestCase):
                                 "--op-executable",
                                 str(fake_op),
                                 "--op-auth-mode",
-                                "ephemeral",
+                                "direct",
                                 "--op-account",
                                 "example",
                                 "--linear-endpoint",
