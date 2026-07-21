@@ -13,6 +13,7 @@ SKILL_PATH = SKILL_DIR / "SKILL.md"
 PUBLIC_TEXT_SURFACES = (
     SKILL_PATH,
     SKILL_DIR / "agents" / "openai.yaml",
+    SKILL_DIR / "references" / "runtime-and-installation.md",
     REPO_ROOT / "README.md",
 )
 
@@ -22,19 +23,18 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
         text = SKILL_PATH.read_text(encoding="utf-8")
 
         required_markers = (
-            "consumer-provided `mailctl`",
+            "Ars Operandi `mailctl` runtime",
             "sole mail runtime",
-            "<runtime-repo>",
-            "<provider>",
+            "<ars-operandi-repo>",
             "exactly `gws` or `proton`",
-            "one canonical `mailctl` dispatches internally",
-            "unknown provider",
+            "One canonical `mailctl`",
+            "Unknown provider",
             "provider mismatch",
-            "no cross-provider fallback",
-            "--project-index \"<project-index>\"",
-            "--config-root \"<config-root>\"",
-            "--account \"<alias>\"",
-            "uv run --project \"<runtime-repo>\" mailctl status --account \"<alias>\"",
+            "cross-provider fallback",
+            '--project-index "<project-index>"',
+            '--config-root "<config-root>"',
+            '--account "<alias>"',
+            'uv run --project "<ars-operandi-repo>" mailctl status --account "<alias>"',
             "gws auth login --readonly --services gmail",
             "users.getProfile",
             "users.messages.list",
@@ -43,7 +43,7 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
             "exact identity",
             "--after YYYY-MM-DD",
             "--before YYYY-MM-DD",
-            "--max-results 1",
+            "--max-results 10",
             "metadata",
             "mailctl content",
             "mailctl attachment",
@@ -59,7 +59,7 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
             "Date",
             "planned",
             "fail closed",
-            "Never fall back",
+            "do not retry on a different account or provider",
         )
         for marker in required_markers:
             with self.subTest(marker=marker):
@@ -76,17 +76,18 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
         for line in command_lines:
             with self.subTest(command=line):
                 self.assertTrue(
-                    line.startswith('uv run --project "<runtime-repo>" mailctl '),
+                    line.startswith('uv run --project "<ars-operandi-repo>" mailctl '),
                     line,
                 )
 
-    def test_skill_keeps_provider_specific_onboarding_and_reads_fail_closed(self) -> None:
+    def test_skill_keeps_provider_specific_onboarding_and_reads_fail_closed(
+        self,
+    ) -> None:
         text = SKILL_PATH.read_text(encoding="utf-8")
 
         required_markers = (
-            "GWS OAuth is available only for a `gws` route",
-            "unavailable for a `proton` route",
-            "Proton activation is a separate confirmed human gate",
+            "GWS browser consent remains a human CLI gate and is unavailable for Proton",
+            "Proton activation remains external",
             "must not install, sign in to, or configure Proton Mail Bridge",
             "must not create, read, print, or reveal credentials",
             "at most 31 days",
@@ -97,8 +98,8 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
             "fixed `From`, `To`, `Subject`, and `Date` headers",
             "SMTP",
             "raw IMAP",
-            "binding is `planned`",
-            "binding is `verified`",
+            "`planned` binding",
+            "`verified` binding",
             "GWS selectors",
             "`OR`, braces, pipe, `in:anywhere`, `older_than`, and `newer_than`",
         )
@@ -106,25 +107,18 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, text)
 
-        proton_search = re.search(
-            r"Proton bounded search[^`]*```bash\n(?P<command>[^`]+)```",
-            text,
-            flags=re.DOTALL,
+        proton_line = next(
+            line
+            for line in text.splitlines()
+            if 'mailctl search --account "<proton-alias>"' in line
         )
-        self.assertIsNotNone(proton_search)
-        assert proton_search is not None
-        command = proton_search.group("command")
-        self.assertIn('mailctl search --account "<proton-alias>"', command)
-        self.assertNotIn("--query", command)
-
-        gws_search = re.search(
-            r"GWS bounded search[^`]*```bash\n(?P<command>[^`]+)```",
-            text,
-            flags=re.DOTALL,
+        gws_line = next(
+            line
+            for line in text.splitlines()
+            if 'mailctl search --account "<gws-alias>"' in line
         )
-        self.assertIsNotNone(gws_search)
-        assert gws_search is not None
-        self.assertIn('--query "<selector>"', gws_search.group("command"))
+        self.assertNotIn("--query", proton_line)
+        self.assertIn('--query "<selector>"', gws_line)
 
         self.assertNotIn("Proceed only when `<provider>` is exactly `gmail`", text)
         self.assertNotIn(
@@ -132,30 +126,32 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
             text,
         )
 
-    def test_skill_encodes_transitional_runtime_ownership_and_atomic_cutover(self) -> None:
+    def test_skill_encodes_runtime_ownership_session_and_atomic_cutover(self) -> None:
         skill = re.sub(r"\s+", " ", SKILL_PATH.read_text(encoding="utf-8"))
-        readme = re.sub(
-            r"\s+", " ", (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        )
+        raw_readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        readme = re.sub(r"\s+", " ", raw_readme)
 
         for marker in (
-            "Ars Operandi is the durable owner of the public mail operating surface",
-            "transitional source of the on-demand `mailctl` command",
-            "The only permitted entrypoint is `mailctl`",
-            "must not activate or install any other Workflow Agent subsystem",
-            "daemon, scheduler, job, intake, Linear, vault, WhatsApp, task, thread, portfolio, or Pi",
-            "separate bounded cutover change",
-            "generalize the consumer-specific aliases",
-            "transfer the `mailctl` runtime and its tests into Ars Operandi",
-            "switch discovery and consumer invocation atomically",
-            "Dual-running and residual runtime copies are forbidden",
-            "remove Workflow Agent from runtime discovery and the consumer Project Index",
+            "Ars Operandi owns the canonical runtime package, tests, skill, and installer",
+            "inactive transitional source",
+            "one atomic cutover",
+            "one live authorization followed by two bounded operations without a second prompt",
+            "switch consumer invocation and runtime discovery to Ars in the same change",
+            "Dual-running and residual active runtime copies are forbidden",
+            "remove Workflow Agent mail runtime discovery and its consumer binding",
+            "Pi surface",
+            "one Mac-local `ars-mail` MCP process",
+            "only in RAM",
+            "Codex/MCP restart is the reauthorization boundary",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, skill)
 
-        self.assertIn("durable owner of the public mail operating surface", readme)
-        self.assertIn("transitional `mailctl` source", readme)
+        self.assertIn("owns the canonical provider-aware mail runtime", readme)
+        self.assertIn("inactive transitional source", readme)
+        self.assertNotIn(
+            "cp -R skills/mailctl-email-access ~/.codex/skills/", raw_readme
+        )
 
     def test_ui_metadata_is_provider_aware(self) -> None:
         metadata = (SKILL_DIR / "agents" / "openai.yaml").read_text(encoding="utf-8")
@@ -196,9 +192,11 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
     )
     def test_explicit_runtime_project_invocation_works_from_external_cwd(self) -> None:
         runtime_repo = Path(os.environ["MAILCTL_RUNTIME_REPO"]).expanduser().resolve()
-        external_cwd = Path(
-            os.environ.get("MAILCTL_FORWARD_TEST_CWD", str(REPO_ROOT.parent))
-        ).expanduser().resolve()
+        external_cwd = (
+            Path(os.environ.get("MAILCTL_FORWARD_TEST_CWD", str(REPO_ROOT.parent)))
+            .expanduser()
+            .resolve()
+        )
 
         self.assertTrue((runtime_repo / "pyproject.toml").is_file())
         self.assertTrue(external_cwd.is_dir())

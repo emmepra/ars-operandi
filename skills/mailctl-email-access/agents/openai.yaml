@@ -1,4 +1,4 @@
 interface:
   display_name: "Mailctl Email Access"
-  short_description: "Use bounded GWS or Proton mail through mailctl"
-  default_prompt: "Use $mailctl-email-access for provider-aware routing through the consumer-provided mailctl runtime and perform only bounded read-only selected mail access."
+  short_description: "Use bounded GWS or Proton metadata through mailctl"
+  default_prompt: "Use $mailctl-email-access through the canonical provider-aware Ars mail MCP and perform only bounded read-only GWS or Proton metadata access."
