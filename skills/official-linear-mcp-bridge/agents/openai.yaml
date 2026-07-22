@@ -1,4 +1,4 @@
 interface:
-  display_name: "Official Linear MCP bridge"
-  short_description: "Operate isolated official Linear MCP connections"
-  default_prompt: "Use $official-linear-mcp-bridge to plan or verify the exact temporary official Linear MCP bridge setup without changing live config unless I explicitly approve apply."
+  display_name: "Official Linear MCP native installer"
+  short_description: "Plan native Linear OAuth aliases with keyring storage"
+  default_prompt: "Use $official-linear-mcp-bridge to plan an exact native Linear MCP OAuth install, staged v2 migration, restore, or finalization without applying live config unless I explicitly approve it."

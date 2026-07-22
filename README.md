@@ -10,7 +10,7 @@ It complements Ora et Labora. Ora et Labora defines the repo-first workflow: iss
 | --- | --- |
 | `codex-thread-manager` | User-facing Codex app thread creation, naming, verification, and project/workstream coordination |
 | `mailctl-email-access` | Fail-closed, bounded GWS or Proton metadata access through a consumer-provided `mailctl` runtime |
-| `official-linear-mcp-bridge` | Temporary transparent STDIO transport to isolated connections of the official Linear MCP |
+| `official-linear-mcp-bridge` | Native official Linear MCP OAuth/keyring config, staged v2 migration, and exact restore |
 | `openrouter-ops` | OpenRouter workspace/key operations, ephemeral runtime key injection, and safe revoke/rotate workflows |
 | `railway-deploy` | Railway deployment, release, variables, services, Postgres links, domains, smoke checks, and rollback notes |
 
@@ -32,21 +32,22 @@ cp -R skills/mailctl-email-access ~/.codex/skills/
 cp -R skills/openrouter-ops ~/.codex/skills/
 ```
 
-`official-linear-mcp-bridge` includes a dry-run-first installer for explicitly
-named, independently authenticated connections to the official Linear MCP. See
+`official-linear-mcp-bridge` retains its legacy name for safe v2 detection, but
+now contains only a dry-run-first native Streamable HTTP OAuth/keyring installer
+for exactly two final, explicitly named connections. See
 its [installation reference](skills/official-linear-mcp-bridge/references/installation-and-operations.md).
 Do not manually copy it and separately register competing MCP configuration.
-The bridge forwards the upstream catalog, annotations, calls, and results without
-defining Linear tools. Project-to-alias routing and identity policy remain owned
-by the consumer and must fail closed; Ars Operandi does not define consumer
-projects, aliases, or accounts.
+There is no local Linear proxy or credential runtime. The official server owns
+the catalog, annotations, calls, and results. Project-to-alias routing and
+identity policy remain consumer-owned and must fail closed; Ars Operandi does
+not define consumer projects, aliases, workspaces, or accounts.
 
 Invoke explicitly when needed:
 
 ```text
 Use $railway-deploy to deploy this app on Railway.
 Use $mailctl-email-access for bounded provider-aware metadata from one explicit consumer route.
-Use $official-linear-mcp-bridge to plan isolated connections to the official Linear MCP.
+Use $official-linear-mcp-bridge to plan two native official Linear MCP OAuth aliases with keyring-only credential storage.
 ```
 
 ## Credential Policy
