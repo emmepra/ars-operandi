@@ -1,0 +1,4 @@
+interface:
+  display_name: "Official Linear MCP bridge"
+  short_description: "Operate isolated official Linear MCP connections"
+  default_prompt: "Use $official-linear-mcp-bridge to plan or verify the exact temporary official Linear MCP bridge setup without changing live config unless I explicitly approve apply."
