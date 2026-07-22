@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dry-run-first installer and exact-target Codex config planner."""
+"""Plan and apply exact native Codex OAuth configuration for Linear MCP."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import stat
-import subprocess
 import sys
 import tempfile
 import tomllib
@@ -22,11 +21,21 @@ from typing import Any, Mapping
 SKILL_NAME = "official-linear-mcp-bridge"
 MARKER_NAME = ".ars-operandi-install.json"
 MARKER_ID = "ars-operandi.official-linear-mcp-bridge"
-MARKER_VERSION = 2
+MARKER_VERSION = 3
+LEGACY_MARKER_VERSION = 2
 MARKER_MODE = 0o600
-BLOCK_BEGIN = "# BEGIN ars-operandi official-linear-mcp-bridge connections v2"
-BLOCK_END = "# END ars-operandi official-linear-mcp-bridge connections v2"
-RUNTIME_TIMEOUT_SECONDS = 120.0
+STATE_MODE = 0o700
+STAGED_STATE_NAME = ".ars-operandi-official-linear-native-v3"
+LINEAR_MCP_ENDPOINT = "https://mcp.linear.app/mcp"
+BLOCK_BEGIN = "# BEGIN ars-operandi official-linear native connections v3"
+BLOCK_END = "# END ars-operandi official-linear native connections v3"
+LEGACY_BLOCK_BEGIN = "# BEGIN ars-operandi official-linear-mcp-bridge connections v2"
+LEGACY_BLOCK_END = "# END ars-operandi official-linear-mcp-bridge connections v2"
+KEYRING_BEGIN = "# BEGIN ars-operandi MCP OAuth keyring invariant v3"
+KEYRING_END = "# END ars-operandi MCP OAuth keyring invariant v3"
+KEYRING_SEGMENT = (
+    f'{KEYRING_BEGIN}\nmcp_oauth_credentials_store = "keyring"\n{KEYRING_END}\n'
+).encode("utf-8")
 _ALIAS_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\Z")
 _ACCOUNT_PATTERN = re.compile(
     r"(?=.{3,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
@@ -35,18 +44,12 @@ _ACCOUNT_PATTERN = re.compile(
 _REFERENCE_SEGMENT_PATTERN = re.compile(
     r"(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2}){1,128}\Z"
 )
-ONEPASSWORD_AUTH_ENV_KEYS = frozenset(
-    {
-        "OP_ACCOUNT",
-        "OP_CONNECT_HOST",
-        "OP_CONNECT_TOKEN",
-        "OP_SERVICE_ACCOUNT_TOKEN",
-        "OP_SESSION",
-    }
-)
+_MISSING = object()
 
 
 class InstallError(RuntimeError):
+    """A fail-closed installer error whose text is safe to print."""
+
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
@@ -54,6 +57,19 @@ class InstallError(RuntimeError):
 
     def payload(self) -> dict[str, str]:
         return {"code": self.code, "message": self.message}
+
+
+def _parse_aliases(values: list[str]) -> tuple[str, str]:
+    if (
+        len(values) != 2
+        or len(set(values)) != 2
+        or any(not _ALIAS_PATTERN.fullmatch(value) for value in values)
+    ):
+        raise InstallError(
+            "invalid_aliases",
+            "Exactly two distinct lowercase MCP aliases are required.",
+        )
+    return values[0], values[1]
 
 
 def _valid_account(value: str) -> bool:
@@ -69,41 +85,36 @@ def _valid_reference(value: str) -> bool:
     )
 
 
-def _parse_connections(values: list[str]) -> tuple[tuple[str, str], ...]:
+def _parse_legacy_connections(raw: object) -> tuple[tuple[str, str], ...]:
+    if not isinstance(raw, list) or not raw:
+        raise InstallError(
+            "legacy_state_invalid", "The legacy installer state is not exact."
+        )
     connections: list[tuple[str, str]] = []
-    for value in values:
-        alias, separator, reference = value.partition("=")
-        if not separator or not _ALIAS_PATTERN.fullmatch(alias):
+    for item in raw:
+        if not isinstance(item, dict):
             raise InstallError(
-                "invalid_connection",
-                "Each connection requires a valid lowercase ALIAS=OP_REFERENCE value.",
+                "legacy_state_invalid", "The legacy installer state is not exact."
             )
-        if not _valid_reference(reference):
+        alias = item.get("alias")
+        reference = item.get("reference")
+        if (
+            not isinstance(alias, str)
+            or not _ALIAS_PATTERN.fullmatch(alias)
+            or not isinstance(reference, str)
+            or not _valid_reference(reference)
+        ):
             raise InstallError(
-                "invalid_connection",
-                "Each connection requires a valid static 1Password reference.",
+                "legacy_state_invalid", "The legacy installer state is not exact."
             )
         connections.append((alias, reference))
     aliases = [alias for alias, _reference in connections]
     references = [reference for _alias, reference in connections]
-    if (
-        not connections
-        or len(set(aliases)) != len(aliases)
-        or len(set(references)) != len(references)
-    ):
+    if len(set(aliases)) != len(aliases) or len(set(references)) != len(references):
         raise InstallError(
-            "invalid_connection",
-            "Connection aliases and references must be present and unique.",
+            "legacy_state_invalid", "The legacy installer state is not exact."
         )
     return tuple(connections)
-
-
-def _clean_runtime_env() -> dict[str, str]:
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if key not in ONEPASSWORD_AUTH_ENV_KEYS and not key.startswith("OP_SESSION")
-    }
 
 
 def _skills_root(value: str | None) -> Path:
@@ -167,31 +178,14 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _managed_block(
-    destination: Path,
-    connections: tuple[tuple[str, str], ...],
-    account: str,
-) -> bytes:
-    adapter = destination / "scripts" / "official_linear_mcp_bridge.py"
+def _managed_block(aliases: tuple[str, str]) -> bytes:
     lines = [BLOCK_BEGIN]
-    for alias, reference in connections:
-        arguments = [
-            "run",
-            "--offline",
-            "--script",
-            str(adapter),
-            "serve",
-            "--op-reference",
-            reference,
-            "--op-account",
-            account,
-        ]
-        rendered_arguments = ", ".join(_toml_string(value) for value in arguments)
+    for alias in aliases:
         lines.extend(
             [
                 f"[mcp_servers.{alias}]",
-                'command = "uv"',
-                f"args = [{rendered_arguments}]",
+                f"url = {_toml_string(LINEAR_MCP_ENDPOINT)}",
+                'auth = "oauth"',
                 "enabled = true",
                 'default_tools_approval_mode = "writes"',
                 "startup_timeout_sec = 60.0",
@@ -202,9 +196,9 @@ def _managed_block(
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def _read_config(path: Path) -> tuple[bytes, int, Mapping[str, Any]]:
+def _read_config(path: Path) -> tuple[bytes, int, Mapping[str, Any], bool]:
     if not path.exists():
-        return b"", 0o600, {}
+        return b"", 0o600, {}, False
     if path.is_symlink() or not path.is_file():
         raise InstallError(
             "config_unavailable", "The Codex config path is not a regular file."
@@ -217,7 +211,17 @@ def _read_config(path: Path) -> tuple[bytes, int, Mapping[str, Any]]:
         raise InstallError(
             "config_invalid", "The Codex config is not valid UTF-8 TOML."
         ) from exc
-    return data, stat.S_IMODE(path.stat().st_mode), parsed
+    return data, stat.S_IMODE(path.stat().st_mode), parsed, True
+
+
+def _parse_config_bytes(data: bytes) -> Mapping[str, Any]:
+    try:
+        decoded = data.decode("utf-8")
+        return tomllib.loads(decoded) if decoded.strip() else {}
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise InstallError(
+            "config_invalid", "The unmanaged Codex config bytes are not valid TOML."
+        ) from exc
 
 
 def _mcp_servers(parsed: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -230,14 +234,37 @@ def _mcp_servers(parsed: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _assert_no_alias_conflict(
-    parsed: Mapping[str, Any], aliases: tuple[str, ...]
+    parsed: Mapping[str, Any], aliases: tuple[str, str]
 ) -> None:
     servers = _mcp_servers(parsed)
     if any(alias in servers for alias in aliases):
         raise InstallError(
             "connection_alias_conflict",
-            "A requested MCP connection alias already exists outside managed state.",
+            "A requested MCP alias already exists outside managed state.",
         )
+
+
+def _keyring_plan(data: bytes, parsed: Mapping[str, Any]) -> tuple[str, bytes]:
+    value = parsed.get("mcp_oauth_credentials_store", _MISSING)
+    has_marker = KEYRING_BEGIN.encode() in data or KEYRING_END.encode() in data
+    if value is _MISSING:
+        if has_marker:
+            raise InstallError(
+                "managed_config_drift",
+                "The managed OAuth keyring invariant has drifted.",
+            )
+        return "managed", KEYRING_SEGMENT + data
+    if value != "keyring":
+        raise InstallError(
+            "oauth_store_conflict",
+            "MCP OAuth credentials must already use the operating-system keyring.",
+        )
+    if has_marker:
+        raise InstallError(
+            "unmanaged_keyring_conflict",
+            "A managed-looking OAuth keyring segment exists without matching state.",
+        )
+    return "preexisting", data
 
 
 def _managed_segment(prefix: bytes, block: bytes) -> bytes:
@@ -245,106 +272,301 @@ def _managed_segment(prefix: bytes, block: bytes) -> bytes:
     return separator + block
 
 
+def _replacement_segment(legacy_segment: bytes, block: bytes) -> bytes:
+    begin = LEGACY_BLOCK_BEGIN.encode("utf-8")
+    if legacy_segment.count(begin) != 1:
+        raise InstallError(
+            "legacy_state_invalid", "The legacy managed config marker is invalid."
+        )
+    prefix = legacy_segment[: legacy_segment.index(begin)]
+    if prefix not in {b"", b"\n"}:
+        raise InstallError(
+            "legacy_state_invalid", "The legacy managed config marker is invalid."
+        )
+    return prefix + block
+
+
 def _split_exact_segment(data: bytes, segment: bytes) -> tuple[bytes, bytes]:
-    if data.count(segment) != 1:
+    if not segment or data.count(segment) != 1:
         raise InstallError(
             "managed_config_drift",
-            "The managed MCP connection config has drift; refusing mutation.",
+            "The managed native MCP config has drifted; refusing mutation.",
         )
     index = data.index(segment)
     return data[:index], data[index + len(segment) :]
 
 
-def _paused_managed_segment(segment: bytes, connection_count: int) -> bytes:
-    enabled_line = b"\nenabled = true\n"
-    paused_line = b"\nenabled = false\n"
-    if (
-        connection_count <= 0
-        or segment.count(enabled_line) != connection_count
-        or segment.count(b"enabled = true") != connection_count
-        or paused_line in segment
-    ):
-        raise InstallError(
-            "managed_config_drift",
-            "The managed MCP connection config cannot be resumed safely.",
-        )
-    return segment.replace(enabled_line, paused_line)
+def _fingerprints(aliases: tuple[str, str]) -> list[str]:
+    return [hashlib.sha256(alias.encode("utf-8")).hexdigest()[:12] for alias in aliases]
+
+
+def _result(
+    *,
+    mode: str,
+    status: str,
+    aliases: tuple[str, str],
+    actions: list[str] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": True,
+        "mode": mode,
+        "status": status,
+        "alias_count": 2,
+        "alias_fingerprints": _fingerprints(aliases),
+    }
+    if actions is not None:
+        payload["actions"] = actions
+    return payload
 
 
 def _marker_payload(
+    *,
     source_hash: str,
-    segment: bytes,
-    connections: tuple[tuple[str, str], ...],
-    account: str,
+    aliases: tuple[str, str],
+    native_segment: bytes,
+    keyring_ownership: str,
+    config_preexisted: bool,
+    lifecycle: str,
+    legacy_marker_sha256: str | None = None,
+    legacy_segment_sha256: str | None = None,
 ) -> dict[str, Any]:
     return {
         "installer": MARKER_ID,
         "version": MARKER_VERSION,
         "source_hash": source_hash,
-        "connections": [
-            {"alias": alias, "reference": reference} for alias, reference in connections
-        ],
-        "op_account": account,
-        "config_segment": segment.decode("utf-8"),
-        "config_segment_sha256": hashlib.sha256(segment).hexdigest(),
+        "aliases": list(aliases),
+        "native_segment": native_segment.decode("utf-8"),
+        "native_segment_sha256": hashlib.sha256(native_segment).hexdigest(),
+        "keyring_ownership": keyring_ownership,
+        "config_preexisted": config_preexisted,
+        "keyring_segment_sha256": (
+            hashlib.sha256(KEYRING_SEGMENT).hexdigest()
+            if keyring_ownership == "managed"
+            else None
+        ),
+        "lifecycle": lifecycle,
+        "legacy_marker_sha256": legacy_marker_sha256,
+        "legacy_segment_sha256": legacy_segment_sha256,
     }
 
 
-def _load_marker(destination: Path) -> dict[str, Any] | None:
-    marker_path = destination / MARKER_NAME
+def _read_marker_file(path: Path) -> tuple[bytes, dict[str, Any]]:
+    if path.is_symlink() or not path.is_file():
+        raise InstallError(
+            "unmanaged_skill_conflict", "The installer marker is unavailable."
+        )
+    raw = path.read_bytes()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InstallError(
+            "unmanaged_skill_conflict", "The installer marker is invalid."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise InstallError(
+            "unmanaged_skill_conflict", "The installer marker is invalid."
+        )
+    return raw, payload
+
+
+def _marker_version(destination: Path) -> int | None:
     if not destination.exists():
         return None
-    if (
-        destination.is_symlink()
-        or not destination.is_dir()
-        or not marker_path.is_file()
-    ):
+    if destination.is_symlink() or not destination.is_dir():
         raise InstallError(
             "unmanaged_skill_conflict",
             "The skill destination exists but is not installer-managed.",
         )
-    try:
-        payload = json.loads(marker_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    _raw, payload = _read_marker_file(destination / MARKER_NAME)
+    version = payload.get("version")
+    return version if isinstance(version, int) else -1
+
+
+def _load_legacy(destination: Path) -> tuple[bytes, dict[str, Any]]:
+    if _marker_version(destination) != LEGACY_MARKER_VERSION:
         raise InstallError(
-            "unmanaged_skill_conflict", "The skill installer marker is invalid."
-        ) from exc
-    segment = payload.get("config_segment") if isinstance(payload, dict) else None
-    raw_connections = payload.get("connections") if isinstance(payload, dict) else None
-    try:
-        connections = _parse_connections(
-            [f"{item['alias']}={item['reference']}" for item in raw_connections]
+            "legacy_state_unavailable",
+            "An exact installer-managed v2 bridge is required for migration.",
         )
-    except (InstallError, KeyError, TypeError):
-        connections = ()
+    marker_path = destination / MARKER_NAME
+    raw, payload = _read_marker_file(marker_path)
+    segment = payload.get("config_segment")
+    _parse_legacy_connections(payload.get("connections"))
+    account = payload.get("op_account")
     if (
-        not isinstance(payload, dict)
-        or payload.get("installer") != MARKER_ID
-        or payload.get("version") != MARKER_VERSION
+        payload.get("installer") != MARKER_ID
+        or payload.get("version") != LEGACY_MARKER_VERSION
         or not isinstance(payload.get("source_hash"), str)
-        or not connections
-        or not isinstance(payload.get("op_account"), str)
-        or not _valid_account(payload["op_account"])
         or not isinstance(segment, str)
+        or not isinstance(account, str)
+        or not _valid_account(account)
         or payload.get("config_segment_sha256")
         != hashlib.sha256(segment.encode("utf-8")).hexdigest()
+        or segment.count(LEGACY_BLOCK_BEGIN) != 1
+        or segment.count(LEGACY_BLOCK_END) != 1
+        or stat.S_IMODE(marker_path.stat().st_mode) != MARKER_MODE
     ):
         raise InstallError(
-            "unmanaged_skill_conflict", "The skill installer marker is invalid."
+            "legacy_state_invalid", "The legacy installer state is not exact."
         )
     if _tree_hash(destination) != payload["source_hash"]:
         raise InstallError(
             "managed_skill_drift",
-            "The managed skill has local drift; refusing mutation.",
+            "The legacy rollback skill has local drift; refusing mutation.",
         )
-    payload["normalized_connections"] = connections
-    return payload
+    return raw, payload
+
+
+def _validate_v3_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    raw_aliases = payload.get("aliases")
+    try:
+        aliases = _parse_aliases(list(raw_aliases))
+    except (InstallError, TypeError):
+        aliases = ()
+    segment = payload.get("native_segment")
+    ownership = payload.get("keyring_ownership")
+    lifecycle = payload.get("lifecycle")
+    if (
+        payload.get("installer") != MARKER_ID
+        or payload.get("version") != MARKER_VERSION
+        or not isinstance(payload.get("source_hash"), str)
+        or len(aliases) != 2
+        or not isinstance(segment, str)
+        or payload.get("native_segment_sha256")
+        != hashlib.sha256(segment.encode("utf-8")).hexdigest()
+        or segment.encode("utf-8") != _replacement_or_append_block(segment, aliases)
+        or ownership not in {"managed", "preexisting"}
+        or not isinstance(payload.get("config_preexisted"), bool)
+        or lifecycle not in {"installed", "staged-v2", "finalized-v2"}
+    ):
+        raise InstallError(
+            "managed_state_drift", "The native installer state is invalid."
+        )
+    expected_keyring_hash = (
+        hashlib.sha256(KEYRING_SEGMENT).hexdigest() if ownership == "managed" else None
+    )
+    if payload.get("keyring_segment_sha256") != expected_keyring_hash:
+        raise InstallError(
+            "managed_state_drift", "The native keyring state is invalid."
+        )
+    normalized = dict(payload)
+    normalized["normalized_aliases"] = aliases
+    return normalized
+
+
+def _replacement_or_append_block(segment: str, aliases: tuple[str, str]) -> bytes:
+    raw = segment.encode("utf-8")
+    block = _managed_block(aliases)
+    if raw == block or raw == b"\n" + block:
+        return raw
+    return b""
+
+
+def _load_v3_destination(destination: Path) -> dict[str, Any] | None:
+    version = _marker_version(destination)
+    if version is None:
+        return None
+    if version != MARKER_VERSION:
+        if version == LEGACY_MARKER_VERSION:
+            raise InstallError(
+                "migration_required",
+                "Use the staged migration command for the installed v2 bridge.",
+            )
+        raise InstallError(
+            "unmanaged_skill_conflict", "The skill installer marker is invalid."
+        )
+    marker_path = destination / MARKER_NAME
+    _raw, payload = _read_marker_file(marker_path)
+    normalized = _validate_v3_payload(payload)
+    if stat.S_IMODE(marker_path.stat().st_mode) != MARKER_MODE:
+        raise InstallError(
+            "managed_state_drift", "The native installer marker mode has drifted."
+        )
+    if _tree_hash(destination) != normalized["source_hash"]:
+        raise InstallError(
+            "managed_skill_drift",
+            "The managed config skill has local drift; refusing mutation.",
+        )
+    return normalized
+
+
+def _state_path(skills_root: Path) -> Path:
+    return skills_root / STAGED_STATE_NAME
+
+
+def _load_staged_state(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_dir():
+        raise InstallError(
+            "managed_state_drift", "The staged migration state is unavailable."
+        )
+    files = [item for item in path.iterdir()]
+    if files != [path / MARKER_NAME] or stat.S_IMODE(path.stat().st_mode) != STATE_MODE:
+        raise InstallError(
+            "managed_state_drift", "The staged migration state has drifted."
+        )
+    marker_path = path / MARKER_NAME
+    _raw, payload = _read_marker_file(marker_path)
+    if stat.S_IMODE(marker_path.stat().st_mode) != MARKER_MODE:
+        raise InstallError(
+            "managed_state_drift", "The staged migration marker has drifted."
+        )
+    normalized = _validate_v3_payload(payload)
+    if normalized["lifecycle"] != "staged-v2":
+        raise InstallError(
+            "managed_state_drift", "The staged migration marker is invalid."
+        )
+    return normalized
+
+
+def _assert_legacy_authority(
+    destination: Path, state: Mapping[str, Any]
+) -> tuple[bytes, dict[str, Any]]:
+    raw, legacy = _load_legacy(destination)
+    segment = legacy["config_segment"].encode("utf-8")
+    if (
+        state.get("legacy_marker_sha256") != hashlib.sha256(raw).hexdigest()
+        or state.get("legacy_segment_sha256") != hashlib.sha256(segment).hexdigest()
+    ):
+        raise InstallError(
+            "legacy_state_drift", "The staged rollback authority has drifted."
+        )
+    return raw, legacy
+
+
+def _assert_native_config_exact(
+    current: bytes, parsed: Mapping[str, Any], marker: Mapping[str, Any]
+) -> None:
+    aliases = marker["normalized_aliases"]
+    segment = marker["native_segment"].encode("utf-8")
+    if segment != _replacement_or_append_block(marker["native_segment"], aliases):
+        raise InstallError(
+            "managed_state_drift", "The native installer state is invalid."
+        )
+    _split_exact_segment(current, segment)
+    if parsed.get("mcp_oauth_credentials_store") != "keyring":
+        raise InstallError(
+            "managed_config_drift", "The OAuth keyring invariant has drifted."
+        )
+    if marker["keyring_ownership"] == "managed":
+        _split_exact_segment(current, KEYRING_SEGMENT)
+    servers = _mcp_servers(parsed)
+    expected = {
+        "url": LINEAR_MCP_ENDPOINT,
+        "auth": "oauth",
+        "enabled": True,
+        "default_tools_approval_mode": "writes",
+        "startup_timeout_sec": 60.0,
+    }
+    if any(servers.get(alias) != expected for alias in aliases):
+        raise InstallError(
+            "managed_config_drift", "The managed native MCP aliases have drifted."
+        )
 
 
 def _stage_skill(
-    source: Path,
-    destination: Path,
-    marker: Mapping[str, Any],
+    source: Path, destination: Path, marker: Mapping[str, Any]
 ) -> tuple[Path, Path]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging_root = Path(
@@ -355,8 +577,7 @@ def _stage_skill(
         shutil.copytree(source, staged, ignore=_copy_ignore)
         marker_path = staged / MARKER_NAME
         marker_path.write_text(
-            json.dumps(marker, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+            json.dumps(marker, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         marker_path.chmod(MARKER_MODE)
     except Exception:
@@ -365,10 +586,29 @@ def _stage_skill(
     return staging_root, staged
 
 
-def _install_staged_skill(staged: Path, destination: Path) -> Path | None:
+def _stage_state(destination: Path, marker: Mapping[str, Any]) -> tuple[Path, Path]:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=".official-linear-state-", dir=destination.parent)
+    )
+    staged = staging_root / STAGED_STATE_NAME
+    try:
+        staged.mkdir(mode=STATE_MODE)
+        staged.chmod(STATE_MODE)
+        marker_path = staged / MARKER_NAME
+        marker_path.write_text(
+            json.dumps(marker, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        marker_path.chmod(MARKER_MODE)
+    except Exception:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+    return staging_root, staged
+
+
+def _install_staged(staged: Path, destination: Path) -> Path | None:
     backup: Path | None = None
     if destination.exists():
-        (destination / MARKER_NAME).chmod(MARKER_MODE)
         backup = destination.parent / f".official-linear-backup-{uuid.uuid4().hex}"
         os.replace(destination, backup)
     try:
@@ -380,14 +620,13 @@ def _install_staged_skill(staged: Path, destination: Path) -> Path | None:
     return backup
 
 
-def _restore_skill(destination: Path, backup: Path | None) -> None:
+def _restore_directory(destination: Path, backup: Path | None) -> None:
     failed: Path | None = None
     if destination.exists():
         failed = destination.parent / f".official-linear-failed-{uuid.uuid4().hex}"
         os.replace(destination, failed)
     if backup is not None and backup.exists():
         os.replace(backup, destination)
-        (destination / MARKER_NAME).chmod(MARKER_MODE)
     if failed is not None:
         shutil.rmtree(failed, ignore_errors=True)
 
@@ -409,271 +648,421 @@ def _atomic_write(path: Path, data: bytes, mode: int) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _run_runtime_step(adapter: Path, *, offline: bool) -> None:
-    command = ["uv", "run"]
-    if offline:
-        command.append("--offline")
-    command.extend(["--script", str(adapter), "--help"])
+def _restore_config_after_failure(
+    path: Path,
+    current: bytes,
+    mode: int,
+    preexisted: bool,
+    expected_written: bytes,
+) -> None:
     try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=RUNTIME_TIMEOUT_SECONDS,
-            env=_clean_runtime_env(),
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        code = "runtime_offline_failed" if offline else "runtime_prepare_failed"
+        if preexisted:
+            if path.exists() and path.read_bytes() == current:
+                return
+            _atomic_write(path, current, mode)
+            return
+        if not path.exists():
+            return
+        if path.read_bytes() != expected_written:
+            raise OSError("config changed during failed atomic operation")
+        path.unlink()
+    except OSError as exc:
         raise InstallError(
-            code, "The credential-free bridge runtime check failed closed."
+            "atomic_restore_failed",
+            "A filesystem failure occurred and the prior config could not be restored.",
         ) from exc
-    if completed.returncode != 0:
-        code = "runtime_offline_failed" if offline else "runtime_prepare_failed"
-        raise InstallError(
-            code, "The credential-free bridge runtime check failed closed."
-        )
 
 
-def _prepare_runtime(destination: Path) -> None:
-    adapter = destination / "scripts" / "official_linear_mcp_bridge.py"
-    _run_runtime_step(adapter, offline=False)
-    _run_runtime_step(adapter, offline=True)
+def _write_restored_config(
+    path: Path, data: bytes, mode: int, *, should_exist: bool
+) -> None:
+    _atomic_write(path, data, mode)
+    if not should_exist:
+        path.unlink()
 
 
 def _install(args: argparse.Namespace) -> dict[str, Any]:
+    aliases = _parse_aliases(args.alias)
     source = _source_skill_root()
-    destination = _skills_root(args.skills_root) / SKILL_NAME
-    config_path = _config_path(args.config)
-    connections = _parse_connections(args.connection)
-    aliases = tuple(alias for alias, _reference in connections)
-    if not _valid_account(args.op_account):
+    skills_root = _skills_root(args.skills_root)
+    destination = skills_root / SKILL_NAME
+    if _load_staged_state(_state_path(skills_root)) is not None:
         raise InstallError(
-            "invalid_account", "The explicit 1Password account selector is invalid."
+            "migration_in_progress", "Finalize or restore the staged migration first."
         )
-    installed = _load_marker(destination)
-    marker_is_private = (
-        installed is None
-        or stat.S_IMODE((destination / MARKER_NAME).stat().st_mode) == MARKER_MODE
-    )
-    if args.resume_paused and installed is None:
-        raise InstallError(
-            "resume_unavailable",
-            "Paused managed MCP connections are not installed at this destination.",
-        )
-    current, mode, parsed = _read_config(config_path)
-    desired_block = _managed_block(destination, connections, args.op_account)
+    installed = _load_v3_destination(destination)
+    current, mode, parsed, current_preexisted = _read_config(_config_path(args.config))
     source_hash = _tree_hash(source)
 
     if installed is None:
         _assert_no_alias_conflict(parsed, aliases)
-        desired_segment = _managed_segment(current, desired_block)
-        desired_config = current + desired_segment
+        ownership, with_keyring = _keyring_plan(current, parsed)
+        native_segment = _managed_segment(with_keyring, _managed_block(aliases))
+        desired_config = with_keyring + native_segment
+        config_preexisted = current_preexisted
+        lifecycle = "installed"
     else:
-        old_segment = installed["config_segment"].encode("utf-8")
-        if args.resume_paused:
-            if (
-                installed["normalized_connections"] != connections
-                or installed["op_account"] != args.op_account
-            ):
-                raise InstallError(
-                    "resume_identity_mismatch",
-                    "Resume inputs must exactly match the installed managed connections.",
-                )
-            paused_segment = _paused_managed_segment(
-                old_segment, len(installed["normalized_connections"])
-            )
-            prefix, suffix = _split_exact_segment(current, paused_segment)
-        else:
-            prefix, suffix = _split_exact_segment(current, old_segment)
-        base_config = prefix + suffix
-        try:
-            parsed_base = (
-                tomllib.loads(base_config.decode("utf-8"))
-                if base_config.strip()
-                else {}
-            )
-        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        if installed["normalized_aliases"] != aliases:
             raise InstallError(
-                "config_invalid",
-                "The unmanaged Codex config bytes are not valid UTF-8 TOML.",
-            ) from exc
-        _assert_no_alias_conflict(parsed_base, aliases)
-        desired_segment = _managed_segment(prefix, desired_block)
-        if args.resume_paused and desired_segment != old_segment:
-            raise InstallError(
-                "managed_config_drift",
-                "The managed MCP connection config cannot be resumed safely.",
+                "alias_set_mismatch",
+                "Requested aliases must exactly match the managed native aliases.",
             )
-        desired_config = prefix + desired_segment + suffix
+        _assert_native_config_exact(current, parsed, installed)
+        ownership = installed["keyring_ownership"]
+        native_segment = installed["native_segment"].encode("utf-8")
+        desired_config = current
+        config_preexisted = installed["config_preexisted"]
+        lifecycle = installed["lifecycle"]
 
-    desired_marker = _marker_payload(
-        source_hash, desired_segment, connections, args.op_account
+    marker = _marker_payload(
+        source_hash=source_hash,
+        aliases=aliases,
+        native_segment=native_segment,
+        keyring_ownership=ownership,
+        config_preexisted=config_preexisted,
+        lifecycle=lifecycle,
     )
-    skill_change = (
-        args.resume_paused
-        or installed is None
-        or installed["source_hash"] != source_hash
-        or installed["normalized_connections"] != connections
-        or installed["op_account"] != args.op_account
-        or installed["config_segment"] != desired_segment.decode("utf-8")
-        or not marker_is_private
-    )
+    skill_change = installed is None or installed["source_hash"] != source_hash
     config_change = current != desired_config
-    state_actions = []
+    actions = []
     if skill_change:
-        state_actions.append("install-or-update-skill")
-    config_action = (
-        "resume-exact-paused-connection-block"
-        if args.resume_paused
-        else "add-or-update-exact-connection-block"
-    )
-    actions = [*state_actions, "prepare-credential-free-runtime"]
-    actions.append("verify-configured-offline-runtime")
+        actions.append("install-credential-free-config-skill")
+    if ownership == "managed" and installed is None:
+        actions.append("add-keyring-invariant")
     if config_change:
-        state_actions.append(config_action)
-        actions.append(config_action)
+        actions.append("add-exact-native-connection-block")
+    if not actions:
+        actions.append("verify-exact-native-state")
     if not args.apply:
-        return {
-            "ok": True,
-            "mode": "dry-run",
-            "status": "planned",
-            "aliases": list(aliases),
-            "actions": actions,
-        }
+        return _result(
+            mode="dry-run", status="planned", aliases=aliases, actions=actions
+        )
 
     staging_root: Path | None = None
     backup: Path | None = None
     if skill_change:
         try:
-            staging_root, staged = _stage_skill(source, destination, desired_marker)
-            backup = _install_staged_skill(staged, destination)
+            staging_root, staged = _stage_skill(source, destination, marker)
+            backup = _install_staged(staged, destination)
         except OSError as exc:
             raise InstallError(
-                "skill_apply_failed", "The skill could not be installed atomically."
+                "skill_apply_failed",
+                "The config skill could not be installed atomically.",
             ) from exc
         finally:
             if staging_root is not None:
                 shutil.rmtree(staging_root, ignore_errors=True)
     try:
-        _prepare_runtime(destination)
         if config_change:
-            _atomic_write(config_path, desired_config, mode)
-    except InstallError:
-        if skill_change:
-            _restore_skill(destination, backup)
-        raise
+            _atomic_write(_config_path(args.config), desired_config, mode)
     except OSError as exc:
+        _restore_config_after_failure(
+            _config_path(args.config),
+            current,
+            mode,
+            current_preexisted,
+            desired_config,
+        )
         if skill_change:
-            _restore_skill(destination, backup)
-        if args.resume_paused:
-            try:
-                if config_path.read_bytes() != current:
-                    _atomic_write(config_path, current, mode)
-            except OSError as restore_exc:
-                raise InstallError(
-                    "resume_restore_failed",
-                    "Resume failed and the paused config could not be restored.",
-                ) from restore_exc
+            _restore_directory(destination, backup)
         raise InstallError(
             "config_apply_failed",
-            "The exact connection config block could not be applied atomically.",
+            "The native MCP config could not be applied atomically.",
         ) from exc
     if backup is not None:
         shutil.rmtree(backup, ignore_errors=True)
-    return {
-        "ok": True,
-        "mode": "apply",
-        "status": (
-            "installed"
-            if installed is None
-            else "resumed"
-            if args.resume_paused
-            else "updated"
-            if state_actions
-            else "verified"
-        ),
-        "aliases": list(aliases),
-    }
+    return _result(
+        mode="apply",
+        status="installed"
+        if installed is None
+        else "updated"
+        if skill_change
+        else "verified",
+        aliases=aliases,
+    )
 
 
-def _rollback(args: argparse.Namespace) -> dict[str, Any]:
-    destination = _skills_root(args.skills_root) / SKILL_NAME
-    config_path = _config_path(args.config)
-    installed = _load_marker(destination)
-    current, mode, _parsed = _read_config(config_path)
+def _migrate(args: argparse.Namespace) -> dict[str, Any]:
+    aliases = _parse_aliases(args.alias)
+    source = _source_skill_root()
+    skills_root = _skills_root(args.skills_root)
+    destination = skills_root / SKILL_NAME
+    state_path = _state_path(skills_root)
+    staged_state = _load_staged_state(state_path)
+    current, mode, parsed, current_preexisted = _read_config(_config_path(args.config))
+    legacy_raw, legacy = _load_legacy(destination)
+
+    if staged_state is not None:
+        if staged_state["normalized_aliases"] != aliases:
+            raise InstallError(
+                "alias_set_mismatch",
+                "Requested aliases must exactly match the staged native aliases.",
+            )
+        _assert_legacy_authority(destination, staged_state)
+        _assert_native_config_exact(current, parsed, staged_state)
+        if staged_state["source_hash"] != _tree_hash(source):
+            raise InstallError(
+                "managed_state_drift",
+                "The staged migration source has changed; restore before retrying.",
+            )
+        if not args.apply:
+            return _result(
+                mode="dry-run",
+                status="planned",
+                aliases=aliases,
+                actions=["verify-staged-native-state"],
+            )
+        return _result(mode="apply", status="staged", aliases=aliases)
+
+    legacy_segment = legacy["config_segment"].encode("utf-8")
+    legacy_prefix, legacy_suffix = _split_exact_segment(current, legacy_segment)
+    base_config = legacy_prefix + legacy_suffix
+    base_parsed = _parse_config_bytes(base_config)
+    _assert_no_alias_conflict(base_parsed, aliases)
+    ownership, _with_keyring = _keyring_plan(base_config, base_parsed)
+    native_segment = _replacement_segment(legacy_segment, _managed_block(aliases))
+    native_without_keyring = legacy_prefix + native_segment + legacy_suffix
+    desired_config = (
+        KEYRING_SEGMENT + native_without_keyring
+        if ownership == "managed"
+        else native_without_keyring
+    )
+    _parse_config_bytes(desired_config)
+    marker = _marker_payload(
+        source_hash=_tree_hash(source),
+        aliases=aliases,
+        native_segment=native_segment,
+        keyring_ownership=ownership,
+        config_preexisted=current_preexisted,
+        lifecycle="staged-v2",
+        legacy_marker_sha256=hashlib.sha256(legacy_raw).hexdigest(),
+        legacy_segment_sha256=hashlib.sha256(legacy_segment).hexdigest(),
+    )
+    actions = ["stage-exact-v2-rollback-authority"]
+    if ownership == "managed":
+        actions.append("add-keyring-invariant")
+    actions.append("replace-v2-block-with-native-oauth-block")
+    if not args.apply:
+        return _result(
+            mode="dry-run", status="planned", aliases=aliases, actions=actions
+        )
+
+    staging_root: Path | None = None
+    try:
+        staging_root, staged = _stage_state(state_path, marker)
+        _install_staged(staged, state_path)
+    except OSError as exc:
+        raise InstallError(
+            "state_apply_failed", "The staged migration state could not be installed."
+        ) from exc
+    finally:
+        if staging_root is not None:
+            shutil.rmtree(staging_root, ignore_errors=True)
+    try:
+        _atomic_write(_config_path(args.config), desired_config, mode)
+    except OSError as exc:
+        _restore_config_after_failure(
+            _config_path(args.config),
+            current,
+            mode,
+            current_preexisted,
+            desired_config,
+        )
+        shutil.rmtree(state_path, ignore_errors=True)
+        raise InstallError(
+            "config_apply_failed", "The native migration config could not be applied."
+        ) from exc
+    return _result(mode="apply", status="staged", aliases=aliases)
+
+
+def _config_without_native(
+    current: bytes, marker: Mapping[str, Any]
+) -> tuple[bytes, bytes, bytes]:
+    working = current
+    if marker["keyring_ownership"] == "managed":
+        key_prefix, key_suffix = _split_exact_segment(working, KEYRING_SEGMENT)
+        working = key_prefix + key_suffix
+    segment = marker["native_segment"].encode("utf-8")
+    prefix, suffix = _split_exact_segment(working, segment)
+    return working, prefix, suffix
+
+
+def _restore(args: argparse.Namespace) -> dict[str, Any]:
+    skills_root = _skills_root(args.skills_root)
+    destination = skills_root / SKILL_NAME
+    state_path = _state_path(skills_root)
+    staged = _load_staged_state(state_path)
+    current, mode, parsed, current_preexisted = _read_config(_config_path(args.config))
+
+    if staged is not None:
+        _assert_native_config_exact(current, parsed, staged)
+        _legacy_raw, legacy = _assert_legacy_authority(destination, staged)
+        _working, prefix, suffix = _config_without_native(current, staged)
+        desired_config = prefix + legacy["config_segment"].encode("utf-8") + suffix
+        _parse_config_bytes(desired_config)
+        aliases = staged["normalized_aliases"]
+        actions = [
+            "restore-exact-v2-connection-block",
+            "remove-staged-native-state",
+        ]
+        if staged["keyring_ownership"] == "managed":
+            actions.insert(0, "remove-managed-keyring-invariant")
+        if not args.apply:
+            return _result(
+                mode="dry-run", status="planned", aliases=aliases, actions=actions
+            )
+        removal = state_path.parent / f".official-linear-remove-{uuid.uuid4().hex}"
+        try:
+            os.replace(state_path, removal)
+            _write_restored_config(
+                _config_path(args.config),
+                desired_config,
+                mode,
+                should_exist=staged["config_preexisted"] or bool(desired_config),
+            )
+        except OSError as exc:
+            _restore_config_after_failure(
+                _config_path(args.config),
+                current,
+                mode,
+                current_preexisted,
+                desired_config,
+            )
+            if removal.exists() and not state_path.exists():
+                os.replace(removal, state_path)
+            raise InstallError(
+                "restore_failed",
+                "The staged migration could not be restored atomically.",
+            ) from exc
+        shutil.rmtree(removal)
+        return _result(mode="apply", status="legacy-restored", aliases=aliases)
+
+    installed = _load_v3_destination(destination)
     if installed is None:
         return {
             "ok": True,
             "mode": "apply" if args.apply else "dry-run",
             "status": "no-op",
-            "aliases": [],
+            "alias_count": 0,
+            "alias_fingerprints": [],
         }
-    aliases = tuple(alias for alias, _reference in installed["normalized_connections"])
-    segment = installed["config_segment"].encode("utf-8")
-    prefix, suffix = _split_exact_segment(current, segment)
+    _assert_native_config_exact(current, parsed, installed)
+    _working, prefix, suffix = _config_without_native(current, installed)
     desired_config = prefix + suffix
+    _parse_config_bytes(desired_config)
+    aliases = installed["normalized_aliases"]
+    actions = ["remove-exact-native-connection-block", "remove-managed-config-skill"]
+    if installed["keyring_ownership"] == "managed":
+        actions.insert(0, "remove-managed-keyring-invariant")
     if not args.apply:
-        return {
-            "ok": True,
-            "mode": "dry-run",
-            "status": "planned",
-            "aliases": list(aliases),
-            "actions": ["remove-exact-connection-block", "remove-managed-skill"],
-        }
-
-    try:
-        _atomic_write(config_path, desired_config, mode)
-    except OSError as exc:
-        raise InstallError(
-            "config_apply_failed",
-            "The exact connection config block could not be removed atomically.",
-        ) from exc
+        return _result(
+            mode="dry-run", status="planned", aliases=aliases, actions=actions
+        )
     removal = destination.parent / f".official-linear-remove-{uuid.uuid4().hex}"
     try:
         os.replace(destination, removal)
+        _write_restored_config(
+            _config_path(args.config),
+            desired_config,
+            mode,
+            should_exist=installed["config_preexisted"] or bool(desired_config),
+        )
     except OSError as exc:
-        try:
-            _atomic_write(config_path, current, mode)
-        except OSError as restore_exc:
-            raise InstallError(
-                "rollback_restore_failed",
-                "Rollback failed and the prior config could not be restored.",
-            ) from restore_exc
+        _restore_config_after_failure(
+            _config_path(args.config),
+            current,
+            mode,
+            current_preexisted,
+            desired_config,
+        )
+        if removal.exists() and not destination.exists():
+            os.replace(removal, destination)
         raise InstallError(
-            "skill_remove_failed", "The managed skill could not be removed safely."
+            "restore_failed", "The native install could not be restored atomically."
         ) from exc
     shutil.rmtree(removal)
-    return {
-        "ok": True,
-        "mode": "apply",
-        "status": "removed",
-        "aliases": list(aliases),
-    }
+    return _result(mode="apply", status="removed", aliases=aliases)
+
+
+def _finalize(args: argparse.Namespace) -> dict[str, Any]:
+    source = _source_skill_root()
+    skills_root = _skills_root(args.skills_root)
+    destination = skills_root / SKILL_NAME
+    state_path = _state_path(skills_root)
+    staged = _load_staged_state(state_path)
+    if staged is None:
+        raise InstallError(
+            "finalize_unavailable", "No exact staged v2 migration is available."
+        )
+    _assert_legacy_authority(destination, staged)
+    current, _mode, parsed, _current_preexisted = _read_config(
+        _config_path(args.config)
+    )
+    _assert_native_config_exact(current, parsed, staged)
+    source_hash = _tree_hash(source)
+    if staged["source_hash"] != source_hash:
+        raise InstallError(
+            "managed_state_drift",
+            "The staged migration source has changed; restore before retrying.",
+        )
+    aliases = staged["normalized_aliases"]
+    marker = _marker_payload(
+        source_hash=source_hash,
+        aliases=aliases,
+        native_segment=staged["native_segment"].encode("utf-8"),
+        keyring_ownership=staged["keyring_ownership"],
+        config_preexisted=staged["config_preexisted"],
+        lifecycle="finalized-v2",
+    )
+    actions = [
+        "replace-legacy-runtime-with-credential-free-config-skill",
+        "remove-pre-smoke-rollback-authority",
+    ]
+    if not args.apply:
+        return _result(
+            mode="dry-run", status="planned", aliases=aliases, actions=actions
+        )
+
+    staging_root: Path | None = None
+    legacy_backup: Path | None = None
+    state_backup = state_path.parent / f".official-linear-state-{uuid.uuid4().hex}"
+    try:
+        staging_root, staged_skill = _stage_skill(source, destination, marker)
+        legacy_backup = _install_staged(staged_skill, destination)
+        os.replace(state_path, state_backup)
+    except OSError as exc:
+        if legacy_backup is not None:
+            _restore_directory(destination, legacy_backup)
+        if state_backup.exists() and not state_path.exists():
+            os.replace(state_backup, state_path)
+        raise InstallError(
+            "finalize_failed", "The staged migration could not be finalized atomically."
+        ) from exc
+    finally:
+        if staging_root is not None:
+            shutil.rmtree(staging_root, ignore_errors=True)
+    if legacy_backup is not None:
+        shutil.rmtree(legacy_backup)
+    shutil.rmtree(state_backup)
+    return _result(mode="apply", status="finalized", aliases=aliases)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     install = subparsers.add_parser("install")
-    install.add_argument(
-        "--connection",
-        action="append",
-        required=True,
-        help="Explicit lowercase ALIAS=OP_REFERENCE; repeat for each process.",
-    )
-    install.add_argument("--op-account", required=True)
-    install.add_argument(
-        "--resume-paused",
-        action="store_true",
-        help=(
-            "Resume only an exact installer-managed block whose enabled lines were "
-            "all changed to false."
-        ),
-    )
+    migrate = subparsers.add_parser("migrate")
+    restore = subparsers.add_parser("restore")
     rollback = subparsers.add_parser("rollback")
-    for subparser in (install, rollback):
+    finalize = subparsers.add_parser("finalize")
+    for subparser in (install, migrate):
+        subparser.add_argument(
+            "--alias",
+            action="append",
+            required=True,
+            help="One final lowercase Codex MCP alias; supply exactly twice.",
+        )
+    for subparser in (install, migrate, restore, rollback, finalize):
         subparser.add_argument("--skills-root")
         subparser.add_argument("--config")
         subparser.add_argument("--apply", action="store_true")
@@ -683,7 +1072,14 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        payload = _install(args) if args.command == "install" else _rollback(args)
+        if args.command == "install":
+            payload = _install(args)
+        elif args.command == "migrate":
+            payload = _migrate(args)
+        elif args.command in {"restore", "rollback"}:
+            payload = _restore(args)
+        else:
+            payload = _finalize(args)
         print(json.dumps(payload, sort_keys=True))
         return 0
     except InstallError as exc:
