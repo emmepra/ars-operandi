@@ -39,11 +39,20 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
             "users.getProfile",
             "users.messages.list",
             "users.messages.get",
+            "users.messages.attachments.get",
             "exact identity",
             "--after YYYY-MM-DD",
             "--before YYYY-MM-DD",
             "--max-results 1",
             "metadata",
+            "mailctl content",
+            "mailctl attachment",
+            "sanitized HTML",
+            "untrusted",
+            "must not auto-open or execute",
+            "--max-bytes 1048576",
+            "--max-bytes 25000000",
+            "--output \"/absolute/new/file\"",
             "From",
             "To",
             "Subject",
@@ -118,6 +127,10 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
         self.assertIn('--query "<selector>"', gws_search.group("command"))
 
         self.assertNotIn("Proceed only when `<provider>` is exactly `gmail`", text)
+        self.assertNotIn(
+            "Never request bodies, snippets, threads, attachments",
+            text,
+        )
 
     def test_skill_encodes_transitional_runtime_ownership_and_atomic_cutover(self) -> None:
         skill = re.sub(r"\s+", " ", SKILL_PATH.read_text(encoding="utf-8"))
@@ -147,7 +160,7 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
     def test_ui_metadata_is_provider_aware(self) -> None:
         metadata = (SKILL_DIR / "agents" / "openai.yaml").read_text(encoding="utf-8")
 
-        self.assertIn("GWS or Proton metadata", metadata)
+        self.assertIn("GWS or Proton mail", metadata)
         self.assertIn("provider-aware", metadata)
         self.assertNotIn("bounded Gmail metadata", metadata)
 
@@ -206,7 +219,7 @@ class MailctlEmailAccessSkillContractTests(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("Fail-closed bounded mail metadata access", completed.stdout)
+        self.assertIn("Fail-closed bounded read-only mail access", completed.stdout)
 
 
 if __name__ == "__main__":
