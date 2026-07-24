@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ars-operandi-mail"
+version = "0.1.0"
+description = "Fail-closed, provider-aware mail metadata runtime for Ars Operandi"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.27,<2",
+    "pyyaml>=6,<7",
+]
+
+[project.scripts]
+mailctl = "ars_operandi_mail.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

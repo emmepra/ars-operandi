@@ -9,3 +9,9 @@ AGENTS.local.md
 playwright-report/
 test-results/
 # END Ora et Labora artifact policy
+
+# Local Python runtime artifacts.
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/

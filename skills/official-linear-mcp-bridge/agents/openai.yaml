@@ -1,0 +1,4 @@
+interface:
+  display_name: "Official Linear MCP native installer"
+  short_description: "Plan native Linear OAuth aliases with keyring storage"
+  default_prompt: "Use $official-linear-mcp-bridge to plan an exact native Linear MCP OAuth install, staged v2 migration, restore, or finalization without applying live config unless I explicitly approve it."
