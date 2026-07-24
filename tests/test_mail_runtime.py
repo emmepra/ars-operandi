@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from ars_operandi_mail.config import (
     load_mail_config,
 )
 from ars_operandi_mail.gws import (
+    ATTACHMENT_GET_METHOD,
     GmailReadRequest,
     GwsMailClient,
     GwsMailIdentityError,
@@ -29,7 +31,9 @@ from ars_operandi_mail.gws import (
     clean_gws_environment,
     validate_gmail_request,
 )
+from ars_operandi_mail.mail_content import AttachmentMetadata, MessageContent
 from ars_operandi_mail.proton import (
+    BODYSTRUCTURE_FETCH_ITEM,
     HEADER_FETCH_ITEM,
     KEYCHAIN_SERVICE_PREFIX,
     MacOSKeychainSecretResolver,
@@ -40,6 +44,7 @@ from ars_operandi_mail.proton import (
     ProtonBridgeMailError,
     ProtonBridgePolicyError,
     _build_search_criteria,
+    _encode_message_id,
     _metadata_from_headers,
     _validate_max_results,
 )
@@ -211,6 +216,81 @@ class ConfigTests(unittest.TestCase):
 
 
 class GwsPolicyTests(unittest.TestCase):
+    def test_selected_content_is_normalized_and_attachment_is_explicit(self) -> None:
+        calls: list[str] = []
+
+        class Runner:
+            def run_read(self, request, *, env):
+                calls.append(request.method)
+                if request.method == "users.getProfile":
+                    return {"emailAddress": "home@example.test"}
+                if request.method == MESSAGE_GET_METHOD:
+                    return {
+                        "id": "msg_1",
+                        "payload": {
+                            "headers": [
+                                {"name": "From", "value": "sender@example.test"},
+                                {"name": "To", "value": "home@example.test"},
+                                {"name": "Subject", "value": "Selected"},
+                                {"name": "Date", "value": "Thu, 23 Jul 2026"},
+                            ],
+                            "mimeType": "multipart/mixed",
+                            "parts": [
+                                {
+                                    "partId": "0",
+                                    "mimeType": "text/plain",
+                                    "filename": "",
+                                    "headers": [
+                                        {
+                                            "name": "Content-Type",
+                                            "value": "text/plain; charset=utf-8",
+                                        }
+                                    ],
+                                    "body": {"data": "SGVsbG8gZnJvbSBBcnM"},
+                                },
+                                {
+                                    "partId": "1",
+                                    "mimeType": "application/pdf",
+                                    "filename": "report.pdf",
+                                    "headers": [],
+                                    "body": {
+                                        "attachmentId": "provider-att",
+                                        "size": 3,
+                                    },
+                                },
+                            ],
+                        },
+                    }
+                if request.method == ATTACHMENT_GET_METHOD:
+                    return {"data": "UERG"}
+                raise AssertionError(request.method)
+
+        client = GwsMailClient(
+            GwsAccountConfig(
+                alias="home",
+                email="home@example.test",
+                config_dir=Path("/tmp/home"),
+                binding_state="verified",
+            ),
+            runner=Runner(),
+        )
+        content = client.get_content("msg_1", max_bytes=1024).to_dict()
+        self.assertEqual(content["content"]["text"], "Hello from Ars")
+        attachment_id = content["attachments"][0]["id"]
+        self.assertNotIn("provider-att", attachment_id)
+        self.assertEqual(
+            client.get_attachment("msg_1", attachment_id, max_bytes=10), b"PDF"
+        )
+        self.assertEqual(
+            calls,
+            [
+                "users.getProfile",
+                MESSAGE_GET_METHOD,
+                "users.getProfile",
+                ATTACHMENT_GET_METHOD,
+            ],
+        )
+
     def test_query_is_explicitly_bounded_and_escape_operators_are_denied(self) -> None:
         query = build_query(
             query="from:sender@example.test",
@@ -345,6 +425,70 @@ class ProtonSessionTests(unittest.TestCase):
         self.assertIn(HEADER_FETCH_ITEM, transcript)
         for forbidden in ("STORE", "MOVE", "COPY", "EXPUNGE", "SMTP", "BODY[]"):
             self.assertNotIn(forbidden, transcript)
+
+    def test_selected_content_matches_schema_and_attachment_is_explicit(
+        self,
+    ) -> None:
+        structure = (
+            b'(("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "BASE64" 20 1 '
+            b"NIL NIL NIL NIL)"
+            b'("APPLICATION" "PDF" ("NAME" "report.pdf") NIL NIL "BASE64" 4 '
+            b'NIL ("ATTACHMENT" ("FILENAME" "report.pdf")) NIL NIL) '
+            b'"MIXED" ("BOUNDARY" "x") NIL NIL NIL)'
+        )
+
+        class ContentImap(FakeImap):
+            def uid(self, command: str, *args):
+                if command == "FETCH":
+                    uid = int(str(args[0]))
+                    item = str(args[1])
+                    self.events.append(("uid", command, *args))
+                    if item == BODYSTRUCTURE_FETCH_ITEM:
+                        return "OK", [
+                            f"1 (UID {uid} BODYSTRUCTURE ".encode("ascii")
+                            + structure
+                            + b")"
+                        ]
+                    match = re.fullmatch(r"\(UID BODY\.PEEK\[([0-9.]+)\]\)", item)
+                    if match:
+                        part = match.group(1)
+                        literal = {
+                            "1": b"SGVsbG8gZnJvbSBBcnM=",
+                            "2": b"UERG",
+                        }[part]
+                        descriptor = (
+                            f"1 (UID {uid} BODY[{part}] {{{len(literal)}}}"
+                        ).encode("ascii")
+                        return "OK", [(descriptor, literal), b")"]
+                return super().uid(command, *args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events: list[object] = []
+            backend = FakeSecretBackend(events)
+            client = ProtonBridgeMailClient(
+                self.account(root),
+                secret_resolver=MemoryCachingSecretResolver(backend),
+                imap_factory=lambda host, port, timeout: ContentImap(
+                    host,
+                    port,
+                    timeout=timeout,
+                    events=events,
+                    certificate=b"certificate",
+                ),
+            )
+            message_id = _encode_message_id(7, 1)
+            content = client.get_content(message_id, max_bytes=1024).to_dict()
+            self.assertEqual(content["content"]["text"], "Hello from Ars")
+            self.assertTrue(content["untrusted"])
+            attachment_id = content["attachments"][0]["id"]
+            before_attachment = repr(events)
+            self.assertNotIn("BODY.PEEK[2]", before_attachment)
+            self.assertEqual(
+                client.get_attachment(message_id, attachment_id, max_bytes=10),
+                b"PDF",
+            )
+            self.assertIn("BODY.PEEK[2]", repr(events))
 
     def test_planned_binding_blocks_normal_read_before_secret(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -494,6 +638,23 @@ class FakeMailClient:
     def get_metadata(self, message_id: str):
         return MessageMetadata(message_id, "from", "to", "subject", "date")
 
+    def get_content(self, message_id: str, *, max_bytes: int):
+        return MessageContent(
+            message_id,
+            "from",
+            "to",
+            "subject",
+            "date",
+            "text",
+            "<p>html</p>",
+            False,
+            False,
+            (AttachmentMetadata("part", "file.bin", "application/octet-stream", 4),),
+        )
+
+    def get_attachment(self, message_id: str, attachment_id: str, *, max_bytes: int):
+        return b"safe"
+
     def auth(self):
         return None
 
@@ -531,7 +692,7 @@ class RuntimeAndMcpTests(unittest.TestCase):
                     before="2026-07-20",
                 )
 
-    def test_mcp_has_only_five_read_only_mail_tools_and_no_auth(self) -> None:
+    def test_mcp_has_only_seven_read_only_mail_tools_and_no_auth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             server = build_mcp(self.runtime(Path(tmp)))
             tools = asyncio.run(server.list_tools())
@@ -545,11 +706,35 @@ class RuntimeAndMcpTests(unittest.TestCase):
                 "mail_onboarding",
                 "mail_search",
                 "mail_metadata",
+                "mail_content",
+                "mail_attachment",
             },
         )
         for tool in tools:
             self.assertTrue(tool.annotations.readOnlyHint)
             self.assertFalse(tool.annotations.destructiveHint)
+
+    def test_runtime_selected_content_and_attachment_are_explicit_and_bounded(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = self.runtime(root)
+            content = runtime.content(
+                account="home", message_id="opaque", max_bytes=1024
+            )
+            self.assertTrue(content["message"]["untrusted"])
+            target = root / "selected.bin"
+            receipt = runtime.attachment(
+                account="work",
+                message_id="opaque",
+                attachment_id="part",
+                output_path=target,
+                max_bytes=4,
+            )
+            self.assertEqual(target.read_bytes(), b"safe")
+            self.assertEqual(receipt["byte_count"], 4)
+            self.assertNotIn("output_path", receipt)
 
     def test_process_runtime_reuses_one_keychain_resolution_across_operations(
         self,

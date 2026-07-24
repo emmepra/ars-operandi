@@ -5,12 +5,26 @@ import os
 import re
 import shutil
 import subprocess
+import base64
+import binascii
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
 from .config import GwsAccountConfig
+from .mail_content import (
+    AttachmentMetadata,
+    MailContentPolicyError,
+    MessageContent,
+    decode_text,
+    html_to_text,
+    sanitize_content_type,
+    sanitize_filename,
+    sanitize_html,
+    validate_attachment_max_bytes,
+    validate_content_max_bytes,
+)
 
 
 METADATA_HEADERS = ("From", "To", "Subject", "Date")
@@ -31,9 +45,11 @@ FORBIDDEN_QUERY_SELECTOR_PATTERNS = (
 PROFILE_METHOD = "users.getProfile"
 MESSAGE_LIST_METHOD = "users.messages.list"
 MESSAGE_GET_METHOD = "users.messages.get"
+ATTACHMENT_GET_METHOD = "users.messages.attachments.get"
 ALLOWED_GMAIL_METHODS = frozenset(
-    {PROFILE_METHOD, MESSAGE_LIST_METHOD, MESSAGE_GET_METHOD}
+    {PROFILE_METHOD, MESSAGE_LIST_METHOD, MESSAGE_GET_METHOD, ATTACHMENT_GET_METHOD}
 )
+GMAIL_ATTACHMENT_ID_PREFIX = "gma1_"
 FORBIDDEN_CREDENTIAL_ENV_VARS = frozenset(
     {
         "GOOGLE_WORKSPACE_CLI_TOKEN",
@@ -246,6 +262,74 @@ class GwsMailClient:
         )
         return sanitize_message_metadata(response, expected_id=message_id)
 
+    def get_content(self, message_id: str, *, max_bytes: int) -> MessageContent:
+        self._require_verified_binding()
+        _validate_message_id(message_id)
+        validate_content_max_bytes(max_bytes)
+        self.verify_identity()
+        response = self.runner.run_read(
+            GmailReadRequest(
+                MESSAGE_GET_METHOD,
+                {"userId": "me", "id": message_id, "format": "full"},
+            ),
+            env=self._env(),
+        )
+        return _normalize_gmail_content(
+            response,
+            expected_id=message_id,
+            max_bytes=max_bytes,
+            fetch_body=lambda attachment_id: self._read_provider_attachment(
+                message_id, attachment_id
+            ),
+        )
+
+    def get_attachment(
+        self,
+        message_id: str,
+        attachment_id: str,
+        *,
+        max_bytes: int,
+    ) -> bytes:
+        self._require_verified_binding()
+        _validate_message_id(message_id)
+        validate_attachment_max_bytes(max_bytes)
+        kind, provider_id = _decode_gmail_attachment_id(
+            attachment_id, expected_message_id=message_id
+        )
+        self.verify_identity()
+        if kind == "api":
+            payload = self._read_provider_attachment(message_id, provider_id)
+        else:
+            response = self.runner.run_read(
+                GmailReadRequest(
+                    MESSAGE_GET_METHOD,
+                    {"userId": "me", "id": message_id, "format": "full"},
+                ),
+                env=self._env(),
+            )
+            payload = _gmail_inline_attachment(
+                response,
+                expected_id=message_id,
+                part_id=provider_id,
+            )
+        if len(payload) > max_bytes:
+            raise MailContentPolicyError(
+                "Attachment exceeds the selected max-bytes limit."
+            )
+        return payload
+
+    def _read_provider_attachment(self, message_id: str, attachment_id: str) -> bytes:
+        response = self.runner.run_read(
+            GmailReadRequest(
+                ATTACHMENT_GET_METHOD,
+                {"userId": "me", "messageId": message_id, "id": attachment_id},
+            ),
+            env=self._env(),
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("data"), str):
+            raise GwsMailError("Gmail attachment response is invalid.")
+        return _decode_gmail_data(response["data"])
+
     def onboarding_probe(
         self, *, query: str, after: str, before: str
     ) -> OnboardingProbe:
@@ -311,6 +395,29 @@ def validate_gmail_request(request: GmailReadRequest) -> None:
         ):
             raise GwsMailPolicyError("Gmail list maxResults must be finite.")
         return
+
+    if request.method == ATTACHMENT_GET_METHOD:
+        if set(params) != {"userId", "messageId", "id"} or params.get("userId") != "me":
+            raise GwsMailPolicyError(
+                "Gmail attachment request parameters are not allowed."
+            )
+        message_id = params.get("messageId")
+        attachment_id = params.get("id")
+        if not isinstance(message_id, str) or not isinstance(attachment_id, str):
+            raise GwsMailPolicyError("Gmail attachment request is invalid.")
+        _validate_message_id(message_id)
+        _validate_provider_attachment_id(attachment_id)
+        return
+
+    if set(params) == {"userId", "id", "format"}:
+        if params.get("userId") != "me" or params.get("format") != "full":
+            raise GwsMailPolicyError("Gmail selected content request is invalid.")
+        message_id = params.get("id")
+        if not isinstance(message_id, str):
+            raise GwsMailPolicyError("Gmail message id is invalid.")
+        _validate_message_id(message_id)
+        return
+
     if set(params) != {"userId", "id", "format", "metadataHeaders"}:
         raise GwsMailPolicyError("Gmail metadata request parameters are not allowed.")
     if params.get("userId") != "me" or params.get("format") != "metadata":
@@ -453,6 +560,7 @@ def _method_segments(method: str) -> tuple[str, ...]:
         PROFILE_METHOD: ("users", "getProfile"),
         MESSAGE_LIST_METHOD: ("users", "messages", "list"),
         MESSAGE_GET_METHOD: ("users", "messages", "get"),
+        ATTACHMENT_GET_METHOD: ("users", "messages", "attachments", "get"),
     }
     try:
         return mapping[method]
@@ -489,3 +597,223 @@ def _sanitize_header_value(value: str) -> str:
 
 def _json_params(params: dict[str, object]) -> str:
     return json.dumps(params, separators=(",", ":"), ensure_ascii=True)
+
+
+def _normalize_gmail_content(
+    response: object,
+    *,
+    expected_id: str,
+    max_bytes: int,
+    fetch_body,
+) -> MessageContent:
+    metadata = sanitize_message_metadata(response, expected_id=expected_id)
+    if not isinstance(response, dict) or not isinstance(response.get("payload"), dict):
+        raise GwsMailError("Gmail content response is invalid.")
+    text_chunks: list[str] = []
+    html_chunks: list[str] = []
+    text_truncated = False
+    html_truncated = False
+    attachments: list[AttachmentMetadata] = []
+
+    def visit(part: object, path: tuple[int, ...]) -> None:
+        nonlocal text_truncated, html_truncated
+        if not isinstance(part, dict):
+            raise GwsMailError("Gmail content response is invalid.")
+        mime_type = sanitize_content_type(str(part.get("mimeType", "")))
+        filename = (
+            sanitize_filename(str(part.get("filename", "")))
+            if part.get("filename")
+            else ""
+        )
+        body = part.get("body", {})
+        if not isinstance(body, dict):
+            raise GwsMailError("Gmail content response is invalid.")
+        part_id = str(part.get("partId", ".".join(str(item) for item in path)))
+        provider_attachment_id = body.get("attachmentId")
+        inline_data = body.get("data")
+        declared_size = body.get("size", 0)
+        size = (
+            declared_size
+            if isinstance(declared_size, int) and declared_size >= 0
+            else 0
+        )
+        children = part.get("parts", [])
+        if children:
+            if not isinstance(children, list):
+                raise GwsMailError("Gmail content response is invalid.")
+            for index, child in enumerate(children, start=1):
+                visit(child, (*path, index))
+            return
+
+        is_attachment = bool(filename) or (
+            mime_type not in {"text/plain", "text/html"}
+            and (
+                isinstance(provider_attachment_id, str) or isinstance(inline_data, str)
+            )
+        )
+        if is_attachment:
+            if isinstance(provider_attachment_id, str):
+                _validate_provider_attachment_id(provider_attachment_id)
+                token = f"api:{provider_attachment_id}"
+            elif isinstance(inline_data, str):
+                token = f"part:{part_id}"
+            else:
+                raise GwsMailError("Gmail attachment response is invalid.")
+            attachments.append(
+                AttachmentMetadata(
+                    id=_encode_gmail_attachment_id(expected_id, token),
+                    filename=filename or "attachment",
+                    content_type=mime_type,
+                    size=size,
+                )
+            )
+            return
+        if mime_type not in {"text/plain", "text/html"}:
+            return
+        if isinstance(inline_data, str):
+            payload = _decode_gmail_data(inline_data)
+        elif isinstance(provider_attachment_id, str):
+            _validate_provider_attachment_id(provider_attachment_id)
+            payload = fetch_body(provider_attachment_id)
+        else:
+            payload = b""
+        value, truncated = decode_text(
+            payload,
+            charset=_gmail_part_charset(part),
+            max_bytes=max_bytes,
+        )
+        if mime_type == "text/plain":
+            text_chunks.append(value)
+            text_truncated |= truncated
+        else:
+            html_chunks.append(value)
+            html_truncated |= truncated
+
+    visit(response["payload"], ())
+    text, joined_text_truncated = _join_gmail_text(text_chunks, max_bytes=max_bytes)
+    html_text, joined_html_truncated = _join_gmail_text(
+        html_chunks, max_bytes=max_bytes
+    )
+    text_truncated |= joined_text_truncated
+    html_truncated |= joined_html_truncated
+    safe_html = sanitize_html(html_text) if html_text else ""
+    if not text and safe_html:
+        text = html_to_text(safe_html)
+    return MessageContent(
+        id=metadata.id,
+        sender=metadata.sender,
+        to=metadata.to,
+        subject=metadata.subject,
+        date=metadata.date,
+        text=text,
+        html=safe_html,
+        text_truncated=text_truncated,
+        html_truncated=html_truncated,
+        attachments=tuple(attachments),
+    )
+
+
+def _decode_gmail_data(value: str) -> bytes:
+    if len(value) > 140_000_000:
+        raise MailContentPolicyError("Gmail encoded content is too large.")
+    padding = "=" * (-len(value) % 4)
+    try:
+        return base64.b64decode(value + padding, altchars=b"-_", validate=True)
+    except (binascii.Error, ValueError):
+        raise GwsMailError("Gmail encoded content is invalid.") from None
+
+
+def _encode_gmail_attachment_id(message_id: str, token: str) -> str:
+    payload = f"{message_id}\0{token}".encode()
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return GMAIL_ATTACHMENT_ID_PREFIX + encoded
+
+
+def _decode_gmail_attachment_id(
+    value: str, *, expected_message_id: str
+) -> tuple[str, str]:
+    if not isinstance(value, str) or not value.startswith(GMAIL_ATTACHMENT_ID_PREFIX):
+        raise GwsMailPolicyError("Gmail attachment id is invalid.")
+    token = value.removeprefix(GMAIL_ATTACHMENT_ID_PREFIX)
+    try:
+        raw = base64.b64decode(
+            token + "=" * (-len(token) % 4), altchars=b"-_", validate=True
+        ).decode("utf-8")
+        message_id, kind_and_id = raw.split("\0", 1)
+        kind, provider_id = kind_and_id.split(":", 1)
+    except (binascii.Error, UnicodeError, ValueError):
+        raise GwsMailPolicyError("Gmail attachment id is invalid.") from None
+    if (
+        message_id != expected_message_id
+        or kind not in {"api", "part"}
+        or not provider_id
+    ):
+        raise GwsMailPolicyError("Gmail attachment id is invalid.")
+    if kind == "api":
+        _validate_provider_attachment_id(provider_id)
+    elif re.fullmatch(r"[A-Za-z0-9_.-]+", provider_id) is None:
+        raise GwsMailPolicyError("Gmail attachment id is invalid.")
+    return kind, provider_id
+
+
+def _validate_provider_attachment_id(value: str) -> None:
+    if not value or len(value) > 2048 or re.fullmatch(r"[A-Za-z0-9_-]+", value) is None:
+        raise GwsMailPolicyError("Gmail attachment id is invalid.")
+
+
+def _gmail_inline_attachment(
+    response: object, *, expected_id: str, part_id: str
+) -> bytes:
+    if not isinstance(response, dict) or response.get("id") != expected_id:
+        raise GwsMailError("Gmail content response is invalid.")
+    root = response.get("payload")
+    found: list[bytes] = []
+
+    def visit(part: object) -> None:
+        if not isinstance(part, dict):
+            return
+        if str(part.get("partId", "")) == part_id:
+            body = part.get("body")
+            if isinstance(body, dict) and isinstance(body.get("data"), str):
+                found.append(_decode_gmail_data(body["data"]))
+        children = part.get("parts", [])
+        if isinstance(children, list):
+            for child in children:
+                visit(child)
+
+    visit(root)
+    if len(found) != 1:
+        raise GwsMailError("Gmail attachment response is invalid.")
+    return found[0]
+
+
+def _gmail_part_charset(part: Mapping[str, object]) -> str | None:
+    headers = part.get("headers", [])
+    if not isinstance(headers, list):
+        return None
+    for item in headers:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        value = item.get("value")
+        if (
+            isinstance(name, str)
+            and name.casefold() == "content-type"
+            and isinstance(value, str)
+        ):
+            match = re.search(
+                r'\bcharset\s*=\s*(?:"([^"]+)"|([^;\s]+))',
+                value,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                return match.group(1) or match.group(2)
+    return None
+
+
+def _join_gmail_text(values: list[str], *, max_bytes: int) -> tuple[str, bool]:
+    raw = "\n\n".join(values).encode("utf-8")
+    return (
+        raw[:max_bytes].decode("utf-8", errors="ignore"),
+        len(raw) > max_bytes,
+    )

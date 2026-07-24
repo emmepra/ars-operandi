@@ -6,12 +6,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .mail_content import (
+    DEFAULT_ATTACHMENT_MAX_BYTES,
+    DEFAULT_CONTENT_MAX_BYTES,
+)
 from .service import MailRuntime, build_mcp, safe_error_payload
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fail-closed bounded mail metadata access owned by Ars Operandi."
+        description="Fail-closed bounded read-only mail access owned by Ars Operandi."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -22,14 +26,31 @@ def _parser() -> argparse.ArgumentParser:
         "onboarding-verify",
         "search",
         "metadata",
+        "content",
+        "attachment",
         "serve",
     ):
         command = subparsers.add_parser(name)
         command.add_argument("--project-index", type=Path, required=True)
         command.add_argument("--config-root", type=Path, required=True)
-        if name in {"status", "auth", "onboarding-verify", "search", "metadata"}:
+        if name in {
+            "status",
+            "auth",
+            "onboarding-verify",
+            "search",
+            "metadata",
+            "content",
+            "attachment",
+        }:
             command.add_argument("--account")
-        if name in {"status", "onboarding-verify", "search", "metadata"}:
+        if name in {
+            "status",
+            "onboarding-verify",
+            "search",
+            "metadata",
+            "content",
+            "attachment",
+        }:
             command.add_argument("--project")
         if name in {"onboarding-verify", "search"}:
             command.add_argument("--after", required=True)
@@ -37,8 +58,18 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--query", default="")
         if name == "search":
             command.add_argument("--max-results", type=int, default=10)
-        if name == "metadata":
+        if name in {"metadata", "content", "attachment"}:
             command.add_argument("--message", required=True)
+        if name == "content":
+            command.add_argument(
+                "--max-bytes", type=int, default=DEFAULT_CONTENT_MAX_BYTES
+            )
+        if name == "attachment":
+            command.add_argument("--attachment", required=True)
+            command.add_argument("--output", type=Path, required=True)
+            command.add_argument(
+                "--max-bytes", type=int, default=DEFAULT_ATTACHMENT_MAX_BYTES
+            )
         if name not in {"serve", "auth"}:
             command.add_argument("--json", action="store_true")
     return parser
@@ -76,6 +107,22 @@ def _execute(runtime: MailRuntime, args: argparse.Namespace) -> dict[str, Any]:
             before=args.before,
             query=args.query,
             max_results=args.max_results,
+        )
+    if args.command == "content":
+        return runtime.content(
+            account=args.account,
+            project=args.project,
+            message_id=args.message,
+            max_bytes=args.max_bytes,
+        )
+    if args.command == "attachment":
+        return runtime.attachment(
+            account=args.account,
+            project=args.project,
+            message_id=args.message,
+            attachment_id=args.attachment,
+            output_path=args.output,
+            max_bytes=args.max_bytes,
         )
     return runtime.metadata(
         account=args.account,

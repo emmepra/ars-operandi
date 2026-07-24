@@ -9,7 +9,7 @@ It complements Ora et Labora. Ora et Labora defines the repo-first workflow: iss
 | Skill | Use for |
 | --- | --- |
 | `codex-thread-manager` | User-facing Codex app thread creation, naming, verification, and project/workstream coordination |
-| `mailctl-email-access` | Fail-closed, bounded GWS or Proton metadata access through the canonical Ars mail MCP and CLI |
+| `mailctl-email-access` | Fail-closed, bounded GWS or Proton search, selected content, and attachment access through the canonical Ars mail MCP and CLI |
 | `dual-linear-mcp` | Fail-closed, manifest-driven Linear routing across independently authenticated workspaces |
 | `openrouter-ops` | OpenRouter workspace/key operations, ephemeral runtime key injection, and safe revoke/rotate workflows |
 | `railway-deploy` | Railway deployment, release, variables, services, Postgres links, domains, smoke checks, and rollback notes |
@@ -43,7 +43,7 @@ Invoke explicitly when needed:
 
 ```text
 Use $railway-deploy to deploy this app on Railway.
-Use $mailctl-email-access for bounded provider-aware metadata from one explicit consumer route.
+Use $mailctl-email-access for bounded provider-aware mail from one explicit consumer route.
 ```
 
 ## Credential Policy

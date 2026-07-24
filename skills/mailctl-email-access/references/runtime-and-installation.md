@@ -13,6 +13,8 @@ MCP alias.
 - Restarting Codex or the MCP may require one new Keychain authorization.
 - GWS keeps OAuth state in its isolated provider keyring. Interactive OAuth remains CLI-only.
 - Every operation reloads and validates the explicit manifest and rechecks binding, provider, exact identity, and provider safety policy.
+- Searches remain metadata-only and bounded. Selected message content requires one opaque message id and a finite byte limit.
+- Attachment retrieval requires both opaque ids, a finite byte limit, and a new absolute output path; the runtime refuses overwrite and symlink targets, writes mode `0600`, and never auto-opens or executes the file.
 
 The deployed Keychain service namespace is deliberately preserved during the
 ownership cutover. Its name is a credential compatibility reference, not a
@@ -34,6 +36,12 @@ rollback copy. Apply only after reviewing the dry-run:
 python scripts/install_mail_runtime.py install --runtime-repo "<ars-operandi-repo>" --project-index "<project-index>" --config-root "<config-root>" --replace-existing-skill --apply
 python scripts/install_mail_runtime.py smoke
 ```
+
+Fresh live proof after activation must cover both configured providers with
+sanitized status, exact-identity onboarding, a maximum-one bounded search,
+one explicitly selected message envelope, and one explicitly selected
+attachment written to a new local file. Do not retain message content,
+attachment bytes, provider transcripts, or secrets as verification logs.
 
 The installer fails closed on an unmanaged `ars-mail` MCP, managed skill drift,
 environment-bearing MCP configuration, a non-Ars runtime root, or an unavailable

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import imaplib
@@ -22,6 +23,19 @@ from typing import Any, Callable, Iterator, Protocol
 
 from .config import ProtonBridgeAccountConfig
 from .gws import MessageMetadata, OnboardingProbe
+from .mail_content import (
+    AttachmentMetadata,
+    MailContentPolicyError,
+    MessageContent,
+    decode_text,
+    decode_transfer_payload,
+    html_to_text,
+    sanitize_content_type,
+    sanitize_filename,
+    sanitize_html,
+    validate_attachment_max_bytes,
+    validate_content_max_bytes,
+)
 
 
 BRIDGE_HOST = "127.0.0.1"
@@ -55,6 +69,8 @@ MAX_UID = 4_294_967_295
 HEADER_NAMES = ("From", "To", "Subject", "Date")
 HEADER_FETCH_ITEM = "(UID BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])"
 MESSAGE_ID_PREFIX = "pb1_"
+ATTACHMENT_ID_PREFIX = "pba1_"
+BODYSTRUCTURE_FETCH_ITEM = "(UID BODYSTRUCTURE)"
 
 
 class ProtonBridgeMailError(RuntimeError):
@@ -90,6 +106,17 @@ class _BridgeSession:
     client: Any
     deadline: _Deadline
     uidvalidity: int
+
+
+@dataclass(frozen=True)
+class _MimePart:
+    path: str
+    content_type: str
+    charset: str | None
+    encoding: str
+    size: int
+    filename: str
+    is_attachment: bool
 
 
 class _Deadline:
@@ -326,6 +353,114 @@ class ProtonBridgeMailClient:
                 raise ProtonBridgePolicyError("Proton Bridge message id is stale.")
             return self._fetch_metadata(session, uid)
 
+    def get_content(self, message_id: str, *, max_bytes: int) -> MessageContent:
+        self._require_verified_binding()
+        validate_content_max_bytes(max_bytes)
+        expected_uidvalidity, uid = _decode_message_id(message_id)
+        with self._session() as session:
+            if session.uidvalidity != expected_uidvalidity:
+                raise ProtonBridgePolicyError("Proton Bridge message id is stale.")
+            metadata = self._fetch_metadata(session, uid)
+            parts = self._fetch_structure(session, uid)
+            text_values: list[str] = []
+            html_values: list[str] = []
+            text_truncated = False
+            html_truncated = False
+            attachments: list[AttachmentMetadata] = []
+            for part in parts:
+                if part.is_attachment:
+                    attachments.append(
+                        AttachmentMetadata(
+                            id=_encode_attachment_id(
+                                session.uidvalidity, uid, part.path
+                            ),
+                            filename=part.filename or "attachment",
+                            content_type=part.content_type,
+                            size=part.size,
+                        )
+                    )
+                    continue
+                if part.content_type not in {"text/plain", "text/html"}:
+                    continue
+                raw = self._fetch_part(session, uid, part.path)
+                decoded, transfer_truncated = decode_transfer_payload(
+                    raw,
+                    encoding=part.encoding,
+                    max_bytes=max_bytes,
+                )
+                value, decoded_truncated = decode_text(
+                    decoded,
+                    charset=part.charset,
+                    max_bytes=max_bytes,
+                )
+                if part.content_type == "text/plain":
+                    text_values.append(value)
+                    text_truncated |= transfer_truncated or decoded_truncated
+                else:
+                    html_values.append(value)
+                    html_truncated |= transfer_truncated or decoded_truncated
+            text, joined_text_truncated = _join_bounded(
+                text_values, max_bytes=max_bytes
+            )
+            html_source, joined_html_truncated = _join_bounded(
+                html_values, max_bytes=max_bytes
+            )
+            text_truncated |= joined_text_truncated
+            html_truncated |= joined_html_truncated
+            safe_html = sanitize_html(html_source) if html_values else ""
+            if not text and safe_html:
+                text = html_to_text(safe_html)
+            return MessageContent(
+                id=metadata.id,
+                sender=metadata.sender,
+                to=metadata.to,
+                subject=metadata.subject,
+                date=metadata.date,
+                text=text,
+                html=safe_html,
+                text_truncated=text_truncated,
+                html_truncated=html_truncated,
+                attachments=tuple(attachments),
+            )
+
+    def get_attachment(
+        self,
+        message_id: str,
+        attachment_id: str,
+        *,
+        max_bytes: int,
+    ) -> bytes:
+        self._require_verified_binding()
+        validate_attachment_max_bytes(max_bytes)
+        expected_uidvalidity, uid = _decode_message_id(message_id)
+        attachment_uidvalidity, attachment_uid, part_path = _decode_attachment_id(
+            attachment_id
+        )
+        if (attachment_uidvalidity, attachment_uid) != (expected_uidvalidity, uid):
+            raise ProtonBridgePolicyError("Proton Bridge attachment id is invalid.")
+        with self._session() as session:
+            if session.uidvalidity != expected_uidvalidity:
+                raise ProtonBridgePolicyError("Proton Bridge message id is stale.")
+            matching = [
+                part
+                for part in self._fetch_structure(session, uid)
+                if part.path == part_path and part.is_attachment
+            ]
+            if len(matching) != 1:
+                raise ProtonBridgePolicyError("Proton Bridge attachment id is invalid.")
+            part = matching[0]
+            raw = self._fetch_part(session, uid, part.path)
+            decoded, truncated = decode_transfer_payload(
+                raw,
+                encoding=part.encoding,
+                max_bytes=max_bytes,
+            )
+            if truncated:
+                raise MailContentPolicyError(
+                    "Attachment exceeds the selected max-bytes limit."
+                )
+            return decoded
+
     def _require_verified_binding(self) -> None:
         if not self.account.is_verified:
             raise ProtonBridgePolicyError(
@@ -431,6 +566,34 @@ class ProtonBridgeMailClient:
         return _metadata_from_headers(
             headers, message_id=_encode_message_id(session.uidvalidity, uid)
         )
+
+    def _fetch_structure(
+        self, session: _BridgeSession, uid: int
+    ) -> tuple[_MimePart, ...]:
+        response = self._command(
+            session.client,
+            session.deadline,
+            session.client.uid,
+            "FETCH",
+            str(uid),
+            BODYSTRUCTURE_FETCH_ITEM,
+        )
+        raw = _extract_bodystructure(response[1], expected_uid=uid)
+        return _mime_parts_from_bodystructure(raw)
+
+    def _fetch_part(self, session: _BridgeSession, uid: int, part_path: str) -> bytes:
+        if re.fullmatch(r"[1-9][0-9]*(?:\.[1-9][0-9]*)*", part_path) is None:
+            raise ProtonBridgePolicyError("Proton Bridge MIME part is invalid.")
+        item = f"(UID BODY.PEEK[{part_path}])"
+        response = self._command(
+            session.client,
+            session.deadline,
+            session.client.uid,
+            "FETCH",
+            str(uid),
+            item,
+        )
+        return _extract_part_literal(response[1], expected_uid=uid, part_path=part_path)
 
 
 def _pinned_tls_context() -> ssl.SSLContext:
@@ -650,3 +813,271 @@ def _safe_logout(client: Any, deadline: _Deadline) -> None:
         client.logout()
     except Exception:
         return
+
+
+def _extract_bodystructure(data: object, *, expected_uid: int) -> bytes:
+    if not isinstance(data, (list, tuple)):
+        raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+    uid_pattern = re.compile(rb"\bUID\s+" + str(expected_uid).encode("ascii") + rb"\b")
+    candidates = [
+        item
+        for item in data
+        if isinstance(item, bytes)
+        and uid_pattern.search(item.upper())
+        and b"BODYSTRUCTURE" in item.upper()
+    ]
+    if len(candidates) != 1:
+        raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+    raw = candidates[0]
+    match = re.search(rb"\bBODYSTRUCTURE\s+", raw, flags=re.IGNORECASE)
+    if match is None:
+        raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+    start = raw.find(b"(", match.end())
+    if start < 0:
+        raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+    end = _balanced_parenthesis_end(raw, start)
+    return raw[start:end]
+
+
+def _balanced_parenthesis_end(raw: bytes, start: int) -> int:
+    depth = 0
+    quoted = False
+    escaped = False
+    for index in range(start, len(raw)):
+        value = raw[index]
+        if quoted:
+            if escaped:
+                escaped = False
+            elif value == 92:
+                escaped = True
+            elif value == 34:
+                quoted = False
+            continue
+        if value == 34:
+            quoted = True
+        elif value == 40:
+            depth += 1
+        elif value == 41:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+
+
+def _extract_part_literal(data: object, *, expected_uid: int, part_path: str) -> bytes:
+    if not isinstance(data, (list, tuple)):
+        raise ProtonBridgeMailError("Proton Bridge MIME part response is invalid.")
+    uid_pattern = re.compile(rb"\bUID\s+" + str(expected_uid).encode("ascii") + rb"\b")
+    body_pattern = re.compile(
+        rb"\bBODY\[" + re.escape(part_path.encode("ascii")) + rb"\]",
+        flags=re.IGNORECASE,
+    )
+    literals: list[bytes] = []
+    for item in data:
+        if not isinstance(item, tuple) or len(item) != 2:
+            continue
+        descriptor, literal = item
+        if (
+            isinstance(descriptor, bytes)
+            and isinstance(literal, bytes)
+            and uid_pattern.search(descriptor.upper())
+            and body_pattern.search(descriptor)
+        ):
+            literals.append(literal)
+    if len(literals) != 1:
+        raise ProtonBridgeMailError("Proton Bridge MIME part response is invalid.")
+    return literals[0]
+
+
+def _mime_parts_from_bodystructure(raw: bytes) -> tuple[_MimePart, ...]:
+    parsed = _BodyStructureParser(raw).parse()
+    parts: list[_MimePart] = []
+
+    def walk(node: object, path: str) -> None:
+        if not isinstance(node, list) or not node:
+            raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+        if isinstance(node[0], list):
+            children: list[object] = []
+            for item in node:
+                if not isinstance(item, list):
+                    break
+                children.append(item)
+            for index, child in enumerate(children, start=1):
+                child_path = f"{path}.{index}" if path else str(index)
+                walk(child, child_path)
+            return
+        if len(node) < 7:
+            raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+        media_type = _structure_atom(node[0])
+        subtype = _structure_atom(node[1])
+        params = _structure_params(node[2])
+        encoding = _structure_atom(node[5])
+        size = node[6]
+        if not isinstance(size, int) or size < 0:
+            raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+        disposition = ""
+        disposition_params: dict[str, str] = {}
+        for value in node[7:]:
+            if (
+                isinstance(value, list)
+                and value
+                and _structure_atom(value[0], allow_nil=True)
+                in {"ATTACHMENT", "INLINE"}
+            ):
+                disposition = _structure_atom(value[0])
+                if len(value) > 1:
+                    disposition_params = _structure_params(value[1])
+                break
+        filename = disposition_params.get("FILENAME") or params.get("NAME") or ""
+        content_type = sanitize_content_type(
+            f"{media_type.casefold()}/{subtype.casefold()}"
+        )
+        is_attachment = (
+            bool(filename)
+            or disposition == "ATTACHMENT"
+            or (content_type not in {"text/plain", "text/html"})
+        )
+        parts.append(
+            _MimePart(
+                path=path or "1",
+                content_type=content_type,
+                charset=params.get("CHARSET"),
+                encoding=encoding,
+                size=size,
+                filename=sanitize_filename(filename) if filename else "",
+                is_attachment=is_attachment,
+            )
+        )
+
+    walk(parsed, "")
+    return tuple(parts)
+
+
+class _BodyStructureParser:
+    def __init__(self, raw: bytes) -> None:
+        try:
+            self.text = raw.decode("ascii")
+        except UnicodeDecodeError:
+            raise ProtonBridgeMailError(
+                "Proton Bridge MIME structure is invalid."
+            ) from None
+        self.index = 0
+
+    def parse(self) -> object:
+        value = self._value()
+        self._space()
+        if self.index != len(self.text):
+            raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+        return value
+
+    def _value(self) -> object:
+        self._space()
+        if self.index >= len(self.text):
+            raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+        if self.text[self.index] == "(":
+            self.index += 1
+            values: list[object] = []
+            while True:
+                self._space()
+                if self.index >= len(self.text):
+                    raise ProtonBridgeMailError(
+                        "Proton Bridge MIME structure is invalid."
+                    )
+                if self.text[self.index] == ")":
+                    self.index += 1
+                    return values
+                values.append(self._value())
+        if self.text[self.index] == '"':
+            return self._quoted()
+        start = self.index
+        while self.index < len(self.text) and self.text[self.index] not in " ()":
+            self.index += 1
+        atom = self.text[start : self.index]
+        if not atom:
+            raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+        if atom.upper() == "NIL":
+            return None
+        if atom.isdigit():
+            return int(atom)
+        return atom
+
+    def _quoted(self) -> str:
+        self.index += 1
+        output: list[str] = []
+        while self.index < len(self.text):
+            value = self.text[self.index]
+            self.index += 1
+            if value == '"':
+                return "".join(output)
+            if value == "\\":
+                if self.index >= len(self.text):
+                    break
+                value = self.text[self.index]
+                self.index += 1
+            output.append(value)
+        raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+
+    def _space(self) -> None:
+        while self.index < len(self.text) and self.text[self.index] == " ":
+            self.index += 1
+
+
+def _structure_atom(value: object, *, allow_nil: bool = False) -> str:
+    if value is None and allow_nil:
+        return ""
+    if not isinstance(value, str) or not value:
+        raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+    return value.upper()
+
+
+def _structure_params(value: object) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, list) or len(value) % 2:
+        raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+    output: dict[str, str] = {}
+    for index in range(0, len(value), 2):
+        key = _structure_atom(value[index])
+        raw_value = value[index + 1]
+        if not isinstance(raw_value, str):
+            raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+        output[key] = raw_value
+    return output
+
+
+def _encode_attachment_id(uidvalidity: int, uid: int, part_path: str) -> str:
+    payload = f"{uidvalidity}:{uid}:{part_path}".encode("ascii")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return ATTACHMENT_ID_PREFIX + encoded
+
+
+def _decode_attachment_id(value: str) -> tuple[int, int, str]:
+    if not isinstance(value, str) or not value.startswith(ATTACHMENT_ID_PREFIX):
+        raise ProtonBridgePolicyError("Proton Bridge attachment id is invalid.")
+    token = value.removeprefix(ATTACHMENT_ID_PREFIX)
+    try:
+        decoded = base64.b64decode(
+            token + "=" * (-len(token) % 4), altchars=b"-_", validate=True
+        ).decode("ascii")
+    except (binascii.Error, UnicodeError, ValueError):
+        raise ProtonBridgePolicyError(
+            "Proton Bridge attachment id is invalid."
+        ) from None
+    match = re.fullmatch(
+        r"([1-9][0-9]*):([1-9][0-9]*):([1-9][0-9]*(?:\.[1-9][0-9]*)*)",
+        decoded,
+    )
+    if match is None:
+        raise ProtonBridgePolicyError("Proton Bridge attachment id is invalid.")
+    uidvalidity, uid = (int(item) for item in match.groups()[:2])
+    if uidvalidity > MAX_UID or uid > MAX_UID:
+        raise ProtonBridgePolicyError("Proton Bridge attachment id is invalid.")
+    return uidvalidity, uid, match.group(3)
+
+
+def _join_bounded(values: list[str], *, max_bytes: int) -> tuple[str, bool]:
+    raw = "\n\n".join(values).encode("utf-8")
+    return (
+        raw[:max_bytes].decode("utf-8", errors="ignore"),
+        len(raw) > max_bytes,
+    )
