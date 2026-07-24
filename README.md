@@ -9,17 +9,19 @@ It complements Ora et Labora. Ora et Labora defines the repo-first workflow: iss
 | Skill | Use for |
 | --- | --- |
 | `codex-thread-manager` | User-facing Codex app thread creation, naming, verification, and project/workstream coordination |
-| `mailctl-email-access` | Fail-closed, bounded GWS or Proton search and selected-message access through a consumer-provided `mailctl` runtime |
-| `official-linear-mcp-bridge` | Native official Linear MCP OAuth/keyring config, staged v2 migration, and exact restore |
+| `mailctl-email-access` | Fail-closed, bounded GWS or Proton search, selected content, and attachment access through the canonical Ars mail MCP and CLI |
+| `dual-linear-mcp` | Fail-closed, manifest-driven Linear routing across independently authenticated workspaces |
 | `openrouter-ops` | OpenRouter workspace/key operations, ephemeral runtime key injection, and safe revoke/rotate workflows |
 | `railway-deploy` | Railway deployment, release, variables, services, Postgres links, domains, smoke checks, and rollback notes |
 
 Future adapters may cover Cloudflare, Hetzner, Docker Compose VPS, Tailscale, Resend, and other operational surfaces.
 
-Ars Operandi is the durable owner of the public mail operating surface. Until a
-separate atomic cutover transfers the runtime and tests here, Workflow Agent is
-only the transitional `mailctl` source; none of its other subsystems are part of
-the mail surface or installation contract.
+Ars Operandi owns the canonical provider-aware mail runtime, tests, public
+skill, and dry-run-first installer. Normal Codex reads use one Mac-local
+`ars-mail` MCP process; Proton credentials are resolved once per process and
+retained only in RAM. Workflow Agent may remain only as an inactive transitional
+source until the consumer performs the documented atomic cutover; none of its
+other subsystems belong to this surface.
 
 ## Usage
 
@@ -28,26 +30,20 @@ Copy a skill folder into the user skill directory, or use a skill-specific insta
 ```bash
 cp -R skills/railway-deploy ~/.codex/skills/
 cp -R skills/codex-thread-manager ~/.codex/skills/
-cp -R skills/mailctl-email-access ~/.codex/skills/
 cp -R skills/openrouter-ops ~/.codex/skills/
 ```
 
-`official-linear-mcp-bridge` retains its legacy name for safe v2 detection, but
-now contains only a dry-run-first native Streamable HTTP OAuth/keyring installer
-for exactly two final, explicitly named connections. See
-its [installation reference](skills/official-linear-mcp-bridge/references/installation-and-operations.md).
-Do not manually copy it and separately register competing MCP configuration.
-There is no local Linear proxy or credential runtime. The official server owns
-the catalog, annotations, calls, and results. Project-to-alias routing and
-identity policy remain consumer-owned and must fail closed; Ars Operandi does
-not define consumer projects, aliases, workspaces, or accounts.
+`dual-linear-mcp` includes a dry-run-first installer that also manages the fixed `dual-linear` MCP alias. See its [installation reference](skills/dual-linear-mcp/references/installation-and-operations.md); do not manually copy it and separately register a competing config.
+
+`mailctl-email-access` includes the canonical runtime in this repository and a
+dry-run-first installer for the skill plus the fixed `ars-mail` MCP alias. See
+its [runtime and installation reference](skills/mailctl-email-access/references/runtime-and-installation.md). Do not register a competing mail MCP or copy the runtime into another repository.
 
 Invoke explicitly when needed:
 
 ```text
 Use $railway-deploy to deploy this app on Railway.
-Use $mailctl-email-access for bounded provider-aware selected mail information from one explicit consumer route.
-Use $official-linear-mcp-bridge to plan two native official Linear MCP OAuth aliases with keyring-only credential storage.
+Use $mailctl-email-access for bounded provider-aware mail from one explicit consumer route.
 ```
 
 ## Credential Policy
