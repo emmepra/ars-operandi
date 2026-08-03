@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import threading
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
 
 from .config import (
     GwsAccountConfig,
@@ -61,15 +61,6 @@ class SecretRedactor:
             for character in redacted
         )
         return " ".join(control_neutralized.split())[:1000]
-
-    def value(self, value: Any) -> Any:
-        if isinstance(value, str):
-            return self.text(value)
-        if isinstance(value, Mapping):
-            return {str(key): self.value(item) for key, item in value.items()}
-        if isinstance(value, (list, tuple, set)):
-            return [self.value(item) for item in value]
-        return value
 
 
 class MailRuntime:
@@ -277,7 +268,10 @@ def safe_tool_call(
     runtime: MailRuntime, callback: Callable[[], dict[str, Any]]
 ) -> dict[str, Any]:
     try:
-        return {"ok": True, **runtime.redactor.value(callback())}
+        # Success payloads are already provider-normalized and field-bounded:
+        # applying the error redactor here would rewrite selected mail content
+        # and impose its 1,000-character error-message limit on every string.
+        return {"ok": True, **callback()}
     except Exception as exc:
         return {"ok": False, "error": safe_error_payload(runtime, exc)}
 
