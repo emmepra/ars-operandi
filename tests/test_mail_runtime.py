@@ -736,6 +736,31 @@ class RuntimeAndMcpTests(unittest.TestCase):
             self.assertEqual(receipt["byte_count"], 4)
             self.assertNotIn("output_path", receipt)
 
+    def test_success_payload_preserves_selected_content_without_error_redaction(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self.runtime(Path(tmp))
+            text = ("Line one\nLine two password=mail-value " * 80).strip()
+            html = "<p>" + ("Selected body " * 160) + "</p>"
+            payload = {
+                "message": {
+                    "content": {
+                        "text": text,
+                        "html": html,
+                        "text_truncated": False,
+                        "html_truncated": False,
+                    }
+                }
+            }
+
+            result = safe_tool_call(runtime, lambda: payload)
+
+        self.assertEqual(result["message"]["content"]["text"], text)
+        self.assertEqual(result["message"]["content"]["html"], html)
+        self.assertFalse(result["message"]["content"]["text_truncated"])
+        self.assertFalse(result["message"]["content"]["html_truncated"])
+
     def test_process_runtime_reuses_one_keychain_resolution_across_operations(
         self,
     ) -> None:
