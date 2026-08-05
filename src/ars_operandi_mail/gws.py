@@ -35,6 +35,7 @@ MAX_HEADER_VALUE_LENGTH = 1000
 MAX_MESSAGE_ID_LENGTH = 256
 NONINTERACTIVE_TIMEOUT_SECONDS = 15
 KEYRING_BACKEND = "keyring"
+TOKEN_CACHE_FILENAME = "token_cache.json"
 FORBIDDEN_QUERY_SELECTOR_PATTERNS = (
     r"\bOR\b",
     r"[{}|]",
@@ -217,6 +218,7 @@ class GwsMailClient:
     def auth(self) -> None:
         self.account.config_dir.mkdir(parents=True, exist_ok=True)
         self.runner.auth(env=self._env())
+        invalidate_gws_token_cache(self.account.config_dir)
         self.verify_identity()
 
     def status(self) -> bool:
@@ -529,6 +531,15 @@ def clean_gws_environment(config_dir: Path) -> dict[str, str]:
     clean["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] = str(config_dir)
     clean["GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"] = KEYRING_BACKEND
     return clean
+
+
+def invalidate_gws_token_cache(config_dir: Path) -> None:
+    """Remove derived access-token state after a successful OAuth login."""
+
+    try:
+        (config_dir / TOKEN_CACHE_FILENAME).unlink(missing_ok=True)
+    except OSError as exc:
+        raise GwsMailError("gws token cache could not be invalidated.") from exc
 
 
 def reject_ambient_credential_overrides() -> None:

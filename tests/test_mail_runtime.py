@@ -22,6 +22,7 @@ from ars_operandi_mail.gws import (
     ATTACHMENT_GET_METHOD,
     GmailReadRequest,
     GwsMailClient,
+    GwsMailError,
     GwsMailIdentityError,
     GwsMailPolicyError,
     MESSAGE_GET_METHOD,
@@ -216,6 +217,115 @@ class ConfigTests(unittest.TestCase):
 
 
 class GwsPolicyTests(unittest.TestCase):
+    def test_auth_invalidates_token_cache_before_identity_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            token_cache = config_dir / "token_cache.json"
+            token_cache.write_bytes(b"stale encrypted token")
+            events: list[str] = []
+
+            class Runner:
+                def auth(self, *, env):
+                    events.append("auth")
+
+                def run_read(self, request, *, env):
+                    if token_cache.exists():
+                        raise AssertionError("stale token cache reached identity check")
+                    events.append(request.method)
+                    return {"emailAddress": "home@example.test"}
+
+            client = GwsMailClient(
+                GwsAccountConfig(
+                    alias="home",
+                    email="home@example.test",
+                    config_dir=config_dir,
+                    binding_state="verified",
+                ),
+                runner=Runner(),
+            )
+
+            client.auth()
+
+            self.assertEqual(events, ["auth", "users.getProfile"])
+            self.assertFalse(token_cache.exists())
+
+    def test_auth_with_missing_token_cache_is_a_no_op(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+
+            class Runner:
+                def auth(self, *, env):
+                    return None
+
+                def run_read(self, request, *, env):
+                    return {"emailAddress": "home@example.test"}
+
+            client = GwsMailClient(
+                GwsAccountConfig(
+                    alias="home",
+                    email="home@example.test",
+                    config_dir=config_dir,
+                    binding_state="verified",
+                ),
+                runner=Runner(),
+            )
+
+            client.auth()
+
+    def test_failed_auth_preserves_existing_token_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            token_cache = config_dir / "token_cache.json"
+            token_cache.write_bytes(b"existing encrypted token")
+
+            class Runner:
+                def auth(self, *, env):
+                    raise GwsMailError("gws operation failed (exit code 2).")
+
+                def run_read(self, request, *, env):
+                    raise AssertionError("identity check must not run after failed auth")
+
+            client = GwsMailClient(
+                GwsAccountConfig(
+                    alias="home",
+                    email="home@example.test",
+                    config_dir=config_dir,
+                    binding_state="verified",
+                ),
+                runner=Runner(),
+            )
+
+            with self.assertRaises(GwsMailError):
+                client.auth()
+
+            self.assertEqual(token_cache.read_bytes(), b"existing encrypted token")
+
+    def test_cache_invalidation_failure_stops_before_identity_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            (config_dir / "token_cache.json").write_bytes(b"stale encrypted token")
+
+            class Runner:
+                def auth(self, *, env):
+                    return None
+
+                def run_read(self, request, *, env):
+                    raise AssertionError("identity check must not use stale cache")
+
+            client = GwsMailClient(
+                GwsAccountConfig(
+                    alias="home",
+                    email="home@example.test",
+                    config_dir=config_dir,
+                    binding_state="verified",
+                ),
+                runner=Runner(),
+            )
+
+            with patch.object(Path, "unlink", side_effect=PermissionError):
+                with self.assertRaisesRegex(GwsMailError, "token cache"):
+                    client.auth()
+
     def test_selected_content_is_normalized_and_attachment_is_explicit(self) -> None:
         calls: list[str] = []
 

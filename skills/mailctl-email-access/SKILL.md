@@ -57,9 +57,11 @@ Run it only after naming the exact expected account:
 uv run --project "<ars-operandi-repo>" mailctl auth --account "<gws-alias>" --project-index "<project-index>" --config-root "<config-root>"
 ```
 
-The runtime invokes exactly `gws auth login --readonly --services gmail` and
-then verifies `users.getProfile`. Proton activation remains external to
-`mailctl`; this skill must not install, sign in to, or configure Proton Mail Bridge and must not create, read, print, or reveal credentials.
+The runtime invokes exactly `gws auth login --readonly --services gmail`,
+invalidates the selected profile's derived GWS token cache after a successful
+login, and then verifies `users.getProfile`. Proton activation remains external
+to `mailctl`; this skill must not install, sign in to, or configure Proton Mail Bridge
+and must not create, read, print, or reveal credentials.
 
 ## CLI Diagnostics
 
