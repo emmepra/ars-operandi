@@ -9,16 +9,16 @@ Use this skill to create real Codex app threads that the user can see in the Cod
 
 ## Core Rules
 
-- Create user-facing app threads, not subagents, unless the user explicitly asks for subagents or delegation.
+- When the user requests a visible app thread, do not substitute a subagent for it. Within that thread, bounded executor/validator subagents may be used when the active workspace policy calls for independent delegation.
 - Do not use `codex exec` for app threads. Use it only for explicit non-interactive report runs, and say it will not appear as a normal app thread.
 - Do not use unverified deep links as a creation fallback.
 - Prefer native app thread tools when available: `create_thread`, `list_threads`, `read_thread`, `send_message_to_thread`, `set_thread_title`.
 - Native app thread tools are required for a user-visible Codex Desktop thread. If those tools are unavailable, say the tool surface cannot create a visible app thread in this session.
 - The App Server protocol and bundled fallback script are diagnostic fallbacks only. They must not be treated as successful user-facing thread creation unless they verify a Desktop-visible source.
 - Treat `cli`, `vscode`, and `appServer` thread sources as non-user-visible for Codex Desktop purposes.
-- Verify creation before telling the user a thread exists.
-- Keep the current/default model unless the user asks for a model override.
-- Always request extra-high reasoning for user-requested project threads: with native `create_thread` / `send_message_to_thread`, pass `thinking: "xhigh"` explicitly; with the fallback script, pass `--effort xhigh` or rely on its `xhigh` default.
+- Verify creation before telling the user a thread exists. When an explicit model/effort policy applies, read back the effective values; requested arguments and title verification are not sufficient evidence.
+- Follow the most specific explicit user/workspace model policy. Otherwise omit model and reasoning overrides so the configured Codex defaults apply.
+- Never hard-code a particular effort as a universal thread-manager default. A workspace such as Cerebro may require an explicit model/effort pair; pass that pair through native tools or the fallback script exactly.
 
 ## Coordination Model
 
@@ -104,14 +104,15 @@ A project thread prompt should include:
 - verification expectations
 - final status format
 
-Native tool calls must include `thinking: "xhigh"` for user-requested project threads unless the user explicitly asks for a lower effort. Do not rely on the app default for reasoning effort.
+Native tool calls must follow the explicit user/workspace model policy when one exists. If no such policy exists, omit `model` and `thinking` so Codex inherits the configured defaults. Do not silently substitute a different effort.
 
 Example native creation shape:
 
 ```json
 {
   "target": {"type": "project", "projectId": "/path/to/workspace", "environment": {"type": "local"}},
-  "thinking": "xhigh",
+  "model": "<explicit-model-policy>",
+  "thinking": "<explicit-reasoning-policy>",
   "prompt": "..."
 }
 ```
@@ -125,7 +126,7 @@ Use workflow-context to fetch the relevant Linear issue, project registry entry,
 For implementation threads, include this default guardrail:
 
 ```text
-Do not commit, push, open PRs, deploy, send messages, mutate external systems, spawn subagents, or start heartbeat/monitor automations unless explicitly asked. If blocked, explain the exact blocker instead of guessing.
+Do not commit, push, open PRs, deploy, send messages, mutate external systems, create additional user-facing tasks, or start heartbeat/monitor automations unless explicitly asked. Use bounded subagents only when the workspace policy or delegated objective calls for them, and keep authoritative validation independent from execution. If blocked, explain the exact blocker instead of guessing.
 ```
 
 For read-only research/review threads, set read-only intent clearly and tell the thread not to edit files.
@@ -134,7 +135,7 @@ For read-only research/review threads, set read-only intent clearly and tell the
 
 1. Prefer native app thread tools if the tool surface exposes them.
 2. If native tools are not exposed, do not create a subagent, `codex exec` run, CLI session, or App Server session as a substitute for a visible app thread.
-3. Use `scripts/create_app_thread.mjs` only when a diagnostic fallback is explicitly useful, then require `verified: true` and `visible: true`.
+3. Use `scripts/create_app_thread.mjs` only when a diagnostic fallback is explicitly useful, then require `verified: true`, `visible: true`, and `settingsVerified: true`. The helper reads effective model/reasoning from the App Server `thread/start` response and stops before the delegated turn when an explicit value mismatches.
 4. If the fallback returns `verified: false`, `visible: false`, or a non-user-visible `source`, report that no visible Codex app thread was created. Include the attempted title, cwd, and verification error.
 5. Report the thread title, id, cwd, and whether the turn completed or is still running only after user-visible verification succeeds.
 
@@ -145,22 +146,25 @@ node skills/codex-thread-manager/scripts/create_app_thread.mjs \
   --cwd <project-root-or-worktree> \
   --title "<area>-<project_slug> - <issue_id>-<workstream_slug>" \
   --prompt-file /tmp/thread-prompt.md \
-  --effort xhigh \
+  --model <explicit-model-policy> \
+  --effort <explicit-reasoning-policy> \
   --sandbox workspace-write \
   --approval never
 ```
+
+Omit `--model` and `--effort` when no explicit policy exists; the helper then inherits the configured Codex defaults.
 
 Use `--sandbox read-only` for pure planning/review. Use `--approval on-request` when the thread may need user-confirmed actions. Use `--approval never` only when the prompt forbids high-impact actions and the sandbox is appropriately scoped.
 
 ## Verification
 
-Treat a thread as created only after at least one of these succeeds:
+Treat a thread as created and model-policy compliant only after both identity/visibility and effective settings are verified:
 
-- native thread tool returns a thread id and a later list/read confirms the title
-- fallback script prints both `verified: true` and `visible: true`
-- App Server `thread/list` finds the same id and title with a source that is not `cli`, `vscode`, or `appServer`
+- native thread tool returns a thread id, a later list/read confirms the title, and supported thread metadata reads back the effective model and effort when an explicit policy applies;
+- fallback script prints `verified: true`, `visible: true`, and `settingsVerified: true`, with `effectiveModel`/`effectiveEffort` matching the explicit request;
+- App Server creation reads effective model/effort from `thread/start`, and `thread/list` finds the same id/title with a source that is not `cli`, `vscode`, or `appServer`.
 
-If verification fails, say so and do not claim the thread is visible. If a fallback created a non-visible session, call it an App Server diagnostic session, not a Codex app thread.
+Title/source verification alone never proves model compliance. If effective settings cannot be read back, say the thread settings are unverified and do not mark the relevant acceptance criterion complete. If a fallback created a non-visible session, call it an App Server diagnostic session, not a Codex app thread.
 
 ## Updating The Procedure
 
