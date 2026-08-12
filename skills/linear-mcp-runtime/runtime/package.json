@@ -1,0 +1,16 @@
+{
+  "name": "@ars-operandi/linear-mcp-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned Linear-only mcp-remote runtime managed by Ars Operandi",
+  "license": "MIT",
+  "dependencies": {
+    "mcp-remote": "0.1.38"
+  },
+  "overrides": {
+    "undici": "7.29.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
