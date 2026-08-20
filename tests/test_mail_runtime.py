@@ -8,7 +8,9 @@ import re
 import subprocess
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import yaml
@@ -155,6 +157,27 @@ def valid_gws_auth_status(**overrides: object) -> dict[str, object]:
     }
     payload.update(overrides)
     return payload
+
+
+@contextmanager
+def synthetic_gws_os_account(
+    home: Path,
+    *,
+    account_name: str = "local-user",
+    ambient: dict[str, str] | None = None,
+):
+    ambient_account = {
+        "HOME": str(home),
+        "USER": account_name,
+        "LOGNAME": account_name,
+    }
+    if ambient is not None:
+        ambient_account.update(ambient)
+    record = SimpleNamespace(pw_dir=str(home), pw_name=account_name)
+    with patch("ars_operandi_mail.gws.os.getuid", return_value=501), patch(
+        "ars_operandi_mail.gws.pwd.getpwuid", return_value=record
+    ), patch.dict(os.environ, ambient_account):
+        yield
 
 
 class FakeSecretBackend:
@@ -865,86 +888,285 @@ class GwsPolicyTests(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 with patch.dict(os.environ, {name: "sensitive-value"}):
-                    with self.assertRaises(GwsMailPolicyError):
+                    with self.assertRaises(GwsMailPolicyError) as caught:
                         clean_gws_environment(Path("/tmp/gws"))
+                self.assertEqual(
+                    str(caught.exception),
+                    "Ambient Google credential override is forbidden.",
+                )
+                self.assertNotIn("sensitive-value", str(caught.exception))
 
-    def test_gws_environment_isolates_home_to_absolute_profile(self) -> None:
+    def test_gws_environment_preserves_real_home_and_injects_missing_sentinel(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real-home"
+            real_home.mkdir()
+            adc = real_home / ".config/gcloud/application_default_credentials.json"
+            adc.parent.mkdir(parents=True)
+            adc.touch()
             profile = Path(tmp) / "selected-profile"
-            with patch.dict(os.environ, {"HOME": "/global/home"}):
+            noncanonical_home = real_home / ".." / "real-home"
+            with synthetic_gws_os_account(noncanonical_home):
                 env = clean_gws_environment(profile)
+                selected = profile.resolve()
+                sentinel = Path(env["GOOGLE_APPLICATION_CREDENTIALS"])
+                self.assertEqual(env["HOME"], str(real_home.resolve()))
+                self.assertEqual(env["USER"], "local-user")
+                self.assertEqual(env["LOGNAME"], "local-user")
+                self.assertEqual(
+                    env["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"], str(selected)
+                )
+                self.assertTrue(sentinel.is_absolute())
+                self.assertEqual(sentinel.parent, selected)
+                self.assertFalse(sentinel.exists())
+                self.assertEqual(validate_selected_environment(env), env)
 
-        selected = str(profile.resolve())
-        self.assertEqual(env["HOME"], selected)
-        self.assertEqual(env["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"], selected)
-        self.assertEqual(validate_selected_environment(env), env)
-        adc_path = Path(env["HOME"]) / ".config/gcloud/application_default_credentials.json"
-        self.assertEqual(adc_path.parts[: len(profile.resolve().parts)], profile.resolve().parts)
-        self.assertNotIn("/global/home", str(adc_path))
-
-    def test_selected_environment_rejects_home_or_path_isolation_drift(self) -> None:
+    def test_ambient_os_account_environment_must_match_account_database(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            selected = str((Path(tmp) / "selected-profile").resolve())
-            valid = {
-                "HOME": selected,
-                "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": selected,
-                "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND": "keyring",
-            }
-            validate_selected_environment(valid)
-            invalid = (
-                {**valid, "HOME": str(Path(tmp) / "different-home")},
-                {
-                    **valid,
-                    "HOME": "relative-profile",
-                    "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": "relative-profile",
-                },
-                {
-                    **valid,
-                    "HOME": f"{selected}/../selected-profile",
-                    "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": (
-                        f"{selected}/../selected-profile"
-                    ),
-                },
+            root = Path(tmp)
+            real_home = root / "real-home"
+            other_home = root / "other-home"
+            real_home.mkdir()
+            other_home.mkdir()
+            mismatches = (
+                {"HOME": str(other_home)},
+                {"USER": "other-user"},
+                {"LOGNAME": "other-user"},
             )
-            for env in invalid:
-                with self.subTest(env=env):
-                    with self.assertRaises(GwsMailPolicyError):
-                        validate_selected_environment(env)
+            for ambient in mismatches:
+                with self.subTest(ambient=ambient), synthetic_gws_os_account(
+                    real_home, ambient=ambient
+                ):
+                    with self.assertRaises(GwsMailPolicyError) as caught:
+                        clean_gws_environment(root / "selected-profile")
+                    self.assertEqual(
+                        str(caught.exception),
+                        "The ambient OS account environment for gws is invalid.",
+                    )
+                    rendered = str(caught.exception)
+                    self.assertNotIn(str(real_home), rendered)
+                    self.assertNotIn(str(other_home), rendered)
+                    self.assertNotIn("other-user", rendered)
 
-    def test_preexec_gate_rejects_plaintext_and_isolated_home_adc(self) -> None:
-        forbidden = (
-            Path("credentials.json"),
-            Path(".config/gcloud/application_default_credentials.json"),
-        )
-        for relative_path in forbidden:
-            with self.subTest(relative_path=relative_path):
-                with tempfile.TemporaryDirectory() as tmp:
-                    profile = Path(tmp) / "selected-profile"
-                    profile.mkdir()
-                    env = clean_gws_environment(profile)
-                    self.assertEqual(validate_selected_environment(env), env)
-                    candidate = profile / relative_path
-                    candidate.parent.mkdir(parents=True, exist_ok=True)
-                    candidate.touch()
-                    runner = GwsMailCommandRunner()
-                    actions = (
-                        lambda: runner.status(env=env),
-                        lambda: runner.run_read(
+    def test_invalid_os_account_database_record_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing_home = root / "missing-home"
+            loop = root / "home-loop"
+            loop.symlink_to(loop)
+            invalid_records = (
+                None,
+                SimpleNamespace(pw_dir="relative-home", pw_name="local-user"),
+                SimpleNamespace(pw_dir=str(missing_home), pw_name="local-user"),
+                SimpleNamespace(pw_dir=str(root), pw_name=""),
+                SimpleNamespace(pw_dir=str(loop), pw_name="local-user"),
+            )
+            for record in invalid_records:
+                with self.subTest(record=record), patch(
+                    "ars_operandi_mail.gws.os.getuid", return_value=501
+                ), patch(
+                    "ars_operandi_mail.gws.pwd.getpwuid", return_value=record
+                ):
+                    with self.assertRaises(GwsMailPolicyError) as caught:
+                        clean_gws_environment(root / "selected-profile")
+                    self.assertEqual(
+                        str(caught.exception),
+                        "The local OS account for gws is invalid.",
+                    )
+                    self.assertNotIn(str(root), str(caught.exception))
+
+            with patch("ars_operandi_mail.gws.os.getuid", return_value=501), patch(
+                "ars_operandi_mail.gws.pwd.getpwuid", side_effect=KeyError
+            ):
+                with self.assertRaises(GwsMailPolicyError) as caught:
+                    clean_gws_environment(root / "selected-profile")
+            self.assertEqual(
+                str(caught.exception),
+                "The local OS account for gws is invalid.",
+            )
+
+    def test_selected_environment_rejects_home_config_or_sentinel_drift(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real-home"
+            real_home.mkdir()
+            profile = root / "selected-profile"
+            with synthetic_gws_os_account(real_home):
+                valid = clean_gws_environment(profile)
+                validate_selected_environment(valid)
+                selected = valid["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"]
+                arbitrary_sentinel = str(profile / "arbitrary-adc.json")
+                invalid = (
+                    {**valid, "HOME": str(root / "different-home")},
+                    {**valid, "USER": "different-user"},
+                    {**valid, "LOGNAME": "different-user"},
+                    {
+                        **valid,
+                        "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": "relative-profile",
+                    },
+                    {
+                        **valid,
+                        "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": (
+                            f"{selected}/../selected-profile"
+                        ),
+                    },
+                    {
+                        **valid,
+                        "GOOGLE_APPLICATION_CREDENTIALS": arbitrary_sentinel,
+                    },
+                    {
+                        key: value
+                        for key, value in valid.items()
+                        if key != "GOOGLE_APPLICATION_CREDENTIALS"
+                    },
+                )
+                for env in invalid:
+                    with self.subTest(env=env):
+                        with self.assertRaises(GwsMailPolicyError) as caught:
+                            validate_selected_environment(env)
+                        rendered = str(caught.exception)
+                        self.assertNotIn(str(profile), rendered)
+                        self.assertNotIn(arbitrary_sentinel, rendered)
+                        self.assertNotIn("different-user", rendered)
+
+    def test_missing_sentinel_allows_status_read_and_auth_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real-home"
+            real_home.mkdir()
+            profile = root / "selected-profile"
+            with synthetic_gws_os_account(real_home):
+                env = clean_gws_environment(profile)
+                runner = GwsMailCommandRunner()
+                completed = (
+                    subprocess.CompletedProcess(
+                        [], 0, stdout=json.dumps(valid_gws_auth_status())
+                    ),
+                    subprocess.CompletedProcess(
+                        [], 0, stdout=json.dumps({"emailAddress": "home@example.test"})
+                    ),
+                    subprocess.CompletedProcess([], 0),
+                )
+                with patch(
+                    "ars_operandi_mail.gws.shutil.which", return_value="/bin/gws"
+                ), patch(
+                    "ars_operandi_mail.gws.subprocess.run", side_effect=completed
+                ) as launch:
+                    runner.status(env=env)
+                    self.assertEqual(
+                        runner.run_read(
                             GmailReadRequest("users.getProfile", {"userId": "me"}),
                             env=env,
                         ),
-                        lambda: runner.auth(env=env),
+                        {"emailAddress": "home@example.test"},
                     )
-                    with patch("ars_operandi_mail.gws.subprocess.run") as launch:
-                        for action in actions:
-                            with self.assertRaises(GwsMailPolicyError) as caught:
-                                action()
-                            self.assertEqual(
-                                str(caught.exception),
-                                "GWS plaintext or ADC fallback credentials are forbidden.",
-                            )
-                            self.assertNotIn(str(profile), str(caught.exception))
-                    launch.assert_not_called()
+                    runner.auth(env=env)
+                self.assertEqual(launch.call_count, 3)
+                for call in launch.call_args_list:
+                    self.assertEqual(
+                        call.kwargs["env"]["GOOGLE_APPLICATION_CREDENTIALS"],
+                        env["GOOGLE_APPLICATION_CREDENTIALS"],
+                    )
+
+    def test_preexec_gate_rejects_existing_sentinel_for_all_processes(self) -> None:
+        for kind in ("file", "directory", "symlink"):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    real_home = root / "real-home"
+                    real_home.mkdir()
+                    profile = root / "selected-profile"
+                    profile.mkdir()
+                    with synthetic_gws_os_account(real_home):
+                        env = clean_gws_environment(profile)
+                        self.assertEqual(validate_selected_environment(env), env)
+                        sentinel = Path(env["GOOGLE_APPLICATION_CREDENTIALS"])
+                        if kind == "file":
+                            sentinel.touch()
+                        elif kind == "directory":
+                            sentinel.mkdir()
+                        else:
+                            sentinel.symlink_to(profile / "missing-target")
+                        runner = GwsMailCommandRunner()
+                        actions = (
+                            lambda: runner.status(env=env),
+                            lambda: runner.run_read(
+                                GmailReadRequest(
+                                    "users.getProfile", {"userId": "me"}
+                                ),
+                                env=env,
+                            ),
+                            lambda: runner.auth(env=env),
+                        )
+                        with patch("ars_operandi_mail.gws.subprocess.run") as launch:
+                            for action in actions:
+                                with self.assertRaises(GwsMailPolicyError) as caught:
+                                    action()
+                                self.assertEqual(
+                                    str(caught.exception),
+                                    "GWS plaintext or ADC fallback credentials are forbidden.",
+                                )
+                                rendered = str(caught.exception)
+                                self.assertNotIn(str(profile), rendered)
+                                self.assertNotIn(str(sentinel), rendered)
+                        launch.assert_not_called()
+
+    def test_preexec_gate_keeps_profile_plaintext_credentials_forbidden(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real-home"
+            real_home.mkdir()
+            profile = root / "selected-profile"
+            profile.mkdir()
+            with synthetic_gws_os_account(real_home):
+                env = clean_gws_environment(profile)
+                (profile / "credentials.json").touch()
+                runner = GwsMailCommandRunner()
+                with patch("ars_operandi_mail.gws.subprocess.run") as launch:
+                    with self.assertRaises(GwsMailPolicyError) as caught:
+                        runner.status(env=env)
+                launch.assert_not_called()
+                self.assertEqual(
+                    str(caught.exception),
+                    "GWS plaintext or ADC fallback credentials are forbidden.",
+                )
+
+    def test_preexec_gate_fails_closed_when_sentinel_lstat_fails(self) -> None:
+        original_lstat = Path.lstat
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real-home"
+            real_home.mkdir()
+            profile = root / "selected-profile"
+            profile.mkdir()
+            with synthetic_gws_os_account(real_home):
+                env = clean_gws_environment(profile)
+                sentinel = Path(env["GOOGLE_APPLICATION_CREDENTIALS"])
+
+                def controlled_lstat(candidate: Path):
+                    if candidate == sentinel:
+                        raise PermissionError("sensitive filesystem detail")
+                    return original_lstat(candidate)
+
+                runner = GwsMailCommandRunner()
+                with patch.object(Path, "lstat", new=controlled_lstat), patch(
+                    "ars_operandi_mail.gws.subprocess.run"
+                ) as launch:
+                    with self.assertRaises(GwsMailPolicyError) as caught:
+                        runner.status(env=env)
+                launch.assert_not_called()
+                self.assertEqual(
+                    str(caught.exception),
+                    "GWS plaintext or ADC fallback credentials are forbidden.",
+                )
+                self.assertNotIn(str(sentinel), str(caught.exception))
+                self.assertNotIn("sensitive filesystem detail", str(caught.exception))
 
     def test_cached_status_cannot_bypass_preexec_fallback_gate(self) -> None:
         safe_status = GwsAuthStatus(
@@ -972,7 +1194,10 @@ class GwsPolicyTests(unittest.TestCase):
                 return safe_status
 
         with tempfile.TemporaryDirectory() as tmp:
-            profile = Path(tmp) / "selected-profile"
+            root = Path(tmp)
+            real_home = root / "real-home"
+            real_home.mkdir()
+            profile = root / "selected-profile"
             profile.mkdir()
             runner = PrimedRunner()
             client = GwsMailClient(
@@ -984,12 +1209,15 @@ class GwsPolicyTests(unittest.TestCase):
                 ),
                 runner=runner,
             )
-            client._require_safe_auth_status()
-            (profile / "credentials.json").touch()
-
-            with patch("ars_operandi_mail.gws.subprocess.run") as launch:
-                with self.assertRaises(GwsMailPolicyError) as caught:
-                    client.verify_identity()
+            with synthetic_gws_os_account(real_home):
+                client._require_safe_auth_status()
+                sentinel = Path(
+                    client._env()["GOOGLE_APPLICATION_CREDENTIALS"]
+                )
+                sentinel.touch()
+                with patch("ars_operandi_mail.gws.subprocess.run") as launch:
+                    with self.assertRaises(GwsMailPolicyError) as caught:
+                        client.verify_identity()
 
         self.assertEqual(runner.status_calls, 1)
         launch.assert_not_called()

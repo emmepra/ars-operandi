@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -36,8 +37,13 @@ MAX_MESSAGE_ID_LENGTH = 256
 NONINTERACTIVE_TIMEOUT_SECONDS = 15
 KEYRING_BACKEND = "keyring"
 TOKEN_CACHE_FILENAME = "token_cache.json"
+ADC_DENIAL_SENTINEL_FILENAME = ".ars-operandi-adc-denied.json"
 FALLBACK_CREDENTIAL_ERROR_MESSAGE = (
     "GWS plaintext or ADC fallback credentials are forbidden."
+)
+OS_ACCOUNT_ERROR_MESSAGE = "The local OS account for gws is invalid."
+OS_ACCOUNT_ENV_ERROR_MESSAGE = (
+    "The ambient OS account environment for gws is invalid."
 )
 GWS_REQUIRED_SCOPES = frozenset(
     {
@@ -93,7 +99,11 @@ SAFE_SUBPROCESS_ENV_VARS = frozenset(
     }
 )
 SELECTED_GWS_ENV_VARS = frozenset(
-    {"GOOGLE_WORKSPACE_CLI_CONFIG_DIR", "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"}
+    {
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_WORKSPACE_CLI_CONFIG_DIR",
+        "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND",
+    }
 )
 
 
@@ -678,13 +688,19 @@ def sanitize_message_metadata(response: object, *, expected_id: str) -> MessageM
 
 def clean_gws_environment(config_dir: Path) -> dict[str, str]:
     reject_ambient_credential_overrides()
+    account_home, account_name = _canonical_os_account()
     selected_dir = config_dir.expanduser().resolve()
     clean = {
         name: value
         for name in SAFE_SUBPROCESS_ENV_VARS
         if (value := os.environ.get(name)) is not None
     }
-    clean["HOME"] = str(selected_dir)
+    clean["HOME"] = str(account_home)
+    clean["LOGNAME"] = account_name
+    clean["USER"] = account_name
+    clean["GOOGLE_APPLICATION_CREDENTIALS"] = str(
+        _adc_denial_sentinel(selected_dir)
+    )
     clean["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] = str(selected_dir)
     clean["GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"] = KEYRING_BACKEND
     return clean
@@ -716,9 +732,18 @@ def validate_selected_environment(env: Mapping[str, str]) -> dict[str, str]:
     if (
         not selected_path.is_absolute()
         or str(selected_path.resolve()) != selected_dir
-        or env.get("HOME") != selected_dir
     ):
-        raise GwsMailPolicyError("Selected gws HOME isolation is invalid.")
+        raise GwsMailPolicyError("Selected gws config directory is invalid.")
+    account_home, account_name = _canonical_os_account()
+    if (
+        env.get("HOME") != str(account_home)
+        or env.get("USER") != account_name
+        or env.get("LOGNAME") != account_name
+    ):
+        raise GwsMailPolicyError(OS_ACCOUNT_ENV_ERROR_MESSAGE)
+    expected_sentinel = str(_adc_denial_sentinel(selected_path))
+    if env.get("GOOGLE_APPLICATION_CREDENTIALS") != expected_sentinel:
+        raise GwsMailPolicyError("Selected gws ADC denial sentinel is invalid.")
     _reject_fallback_credential_artifacts(selected_path)
     if env.get("GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND") != KEYRING_BACKEND:
         raise GwsMailPolicyError("gws keyring backend is not enforced.")
@@ -728,10 +753,7 @@ def validate_selected_environment(env: Mapping[str, str]) -> dict[str, str]:
 def _reject_fallback_credential_artifacts(selected_dir: Path) -> None:
     candidates = (
         selected_dir / "credentials.json",
-        selected_dir
-        / ".config"
-        / "gcloud"
-        / "application_default_credentials.json",
+        _adc_denial_sentinel(selected_dir),
     )
     for candidate in candidates:
         try:
@@ -741,6 +763,58 @@ def _reject_fallback_credential_artifacts(selected_dir: Path) -> None:
         except OSError:
             raise GwsMailPolicyError(FALLBACK_CREDENTIAL_ERROR_MESSAGE) from None
         raise GwsMailPolicyError(FALLBACK_CREDENTIAL_ERROR_MESSAGE)
+
+
+def _adc_denial_sentinel(selected_dir: Path) -> Path:
+    return selected_dir / ADC_DENIAL_SENTINEL_FILENAME
+
+
+def _canonical_os_account() -> tuple[Path, str]:
+    try:
+        record = pwd.getpwuid(os.getuid())
+        home_value = record.pw_dir
+        account_name = record.pw_name
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        raise GwsMailPolicyError(OS_ACCOUNT_ERROR_MESSAGE) from None
+    if (
+        not isinstance(home_value, str)
+        or not home_value
+        or not isinstance(account_name, str)
+        or not account_name
+        or account_name.strip() != account_name
+        or any(character.isspace() for character in account_name)
+        or "/" in account_name
+        or ":" in account_name
+        or "\x00" in account_name
+    ):
+        raise GwsMailPolicyError(OS_ACCOUNT_ERROR_MESSAGE)
+    account_home = Path(home_value)
+    if not account_home.is_absolute():
+        raise GwsMailPolicyError(OS_ACCOUNT_ERROR_MESSAGE)
+    try:
+        account_home = account_home.resolve(strict=True)
+        if not account_home.is_dir():
+            raise GwsMailPolicyError(OS_ACCOUNT_ERROR_MESSAGE)
+    except (OSError, RuntimeError):
+        raise GwsMailPolicyError(OS_ACCOUNT_ERROR_MESSAGE) from None
+
+    ambient_home = os.environ.get("HOME")
+    if ambient_home is not None:
+        ambient_path = Path(ambient_home)
+        try:
+            if (
+                not ambient_path.is_absolute()
+                or ambient_path.resolve(strict=True) != account_home
+            ):
+                raise GwsMailPolicyError(OS_ACCOUNT_ENV_ERROR_MESSAGE)
+        except (OSError, RuntimeError):
+            raise GwsMailPolicyError(OS_ACCOUNT_ENV_ERROR_MESSAGE) from None
+    if any(
+        (value := os.environ.get(name)) is not None and value != account_name
+        for name in ("USER", "LOGNAME")
+    ):
+        raise GwsMailPolicyError(OS_ACCOUNT_ENV_ERROR_MESSAGE)
+    return account_home, account_name
 
 
 def _query_uses_forbidden_selector(query: str) -> bool:
