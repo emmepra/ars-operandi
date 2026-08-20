@@ -30,7 +30,8 @@ query bounds, and header allowlists are still checked on every operation.
 - GWS selectors reject `OR`, braces, pipe, `in:anywhere`, `older_than`, and `newer_than`.
 - The GWS allowlist contains only `users.getProfile`, bounded `users.messages.list`, `users.messages.get` in metadata or selected full format, and `users.messages.attachments.get` for one explicitly selected attachment.
 - Proton accepts no free-form selector and enforces at most 31 days, 100 results, and 1000 matched UIDs.
-- GWS requires exact profile identity, isolated keyring-backed config, and rejects ambient tokens, credential files, and Application Default Credentials.
+- Before any GWS profile or mailbox read, structurally validate `gws auth status` and require OAuth2, encrypted credentials in the isolated profile config, an encryption key from the native `keyring` backend, a local client config with a non-empty project id, a decryptable refresh token, a valid token, and the exact gws scope set: `gmail.readonly` plus provider-required `openid`, `userinfo.email`, and `userinfo.profile`. Set the GWS process `HOME` to that absolute profile config so the OS user's global ADC path is unreachable. Before every GWS command, reject profile-local `credentials.json` and `.config/gcloud/application_default_credentials.json` without reading them. Reject plaintext, ambient credentials, ADC fallback, and every additional service or Gmail scope.
+- GWS status and identity failures use fixed sanitized codes and messages. Never return raw status fields, provider errors, identities, client IDs, tokens, secrets, or private paths.
 - Proton requires pinned `localhost` STARTTLS, exact Bridge username, and a dedicated macOS Keychain reference. Provider transcripts, pins, and secrets never enter tool results.
 
 ## MCP Operations
@@ -59,7 +60,8 @@ uv run --project "<ars-operandi-repo>" mailctl auth --account "<gws-alias>" --pr
 
 The runtime invokes exactly `gws auth login --readonly --services gmail`,
 invalidates the selected profile's derived GWS token cache after a successful
-login, and then verifies `users.getProfile`. Proton activation remains external
+login, validates the structured auth status, and only then verifies
+`users.getProfile`. Proton activation remains external
 to `mailctl`; this skill must not install, sign in to, or configure Proton Mail Bridge
 and must not create, read, print, or reveal credentials.
 
