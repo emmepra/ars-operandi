@@ -12,7 +12,12 @@ from .config import (
     ProtonBridgeAccountConfig,
     load_mail_config,
 )
-from .gws import GwsMailClient, GwsMailError
+from .gws import (
+    GwsMailAuthStatusError,
+    GwsMailClient,
+    GwsMailError,
+    GwsMailIdentityError,
+)
 from .mail_content import (
     DEFAULT_ATTACHMENT_MAX_BYTES,
     DEFAULT_CONTENT_MAX_BYTES,
@@ -279,6 +284,8 @@ def safe_tool_call(
 def safe_error_payload(runtime: MailRuntime, exc: Exception) -> dict[str, str]:
     if isinstance(exc, SafeMailError):
         return {"code": exc.code, "message": runtime.redactor.text(exc.message)}
+    if isinstance(exc, (GwsMailAuthStatusError, GwsMailIdentityError)):
+        return {"code": exc.code, "message": exc.message}
     if isinstance(
         exc, (MailConfigError, GwsMailError, ProtonBridgeMailError, MailContentError)
     ):
