@@ -426,6 +426,83 @@ class GwsPolicyTests(unittest.TestCase):
         self.assertNotIn("sensitive-project-id", rendered)
         self.assertNotIn("sensitive@example.test", rendered)
 
+    def test_scope_status_accepts_only_canonical_or_complete_echoed_alias_pair(
+        self,
+    ) -> None:
+        canonical = [
+            "openid",
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+        ]
+        accepted = (
+            list(reversed(canonical)),
+            [
+                "profile",
+                canonical[2],
+                "email",
+                canonical[0],
+                canonical[3],
+                canonical[1],
+            ],
+        )
+        for raw_scopes in accepted:
+            with self.subTest(raw_scopes=raw_scopes):
+                status = parse_gws_auth_status(
+                    valid_gws_auth_status(scopes=raw_scopes)
+                )
+                self.assertEqual(status.scopes, frozenset(canonical))
+                self.assertNotIn("email", status.scopes)
+                self.assertNotIn("profile", status.scopes)
+
+    def test_scope_status_rejects_closed_invalid_matrix(self) -> None:
+        canonical = [
+            "openid",
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+        ]
+        echoed = [*canonical, "email", "profile"]
+        invalid = (
+            ("duplicate-canonical", [*canonical, canonical[0]]),
+            ("duplicate-alias", [*echoed, "email"]),
+            ("email-only-alias", [*canonical, "email"]),
+            ("profile-only-alias", [*canonical, "profile"]),
+            (
+                "email-alias-replaces-canonical",
+                [canonical[0], canonical[1], canonical[3], "email", "profile"],
+            ),
+            (
+                "profile-alias-replaces-canonical",
+                [canonical[0], canonical[1], canonical[2], "email", "profile"],
+            ),
+            ("missing-required", canonical[1:]),
+            (
+                "mutative-gmail",
+                [*canonical, "https://www.googleapis.com/auth/gmail.modify"],
+            ),
+            ("full-gmail", [*canonical, "https://mail.google.com/"]),
+            (
+                "other-service",
+                [*canonical, "https://www.googleapis.com/auth/drive.readonly"],
+            ),
+            ("arbitrary-oidc", [*canonical, "offline_access"]),
+            ("non-list", tuple(canonical)),
+            ("empty-item", [*canonical, ""]),
+            ("non-string-item", [*canonical, 7]),
+        )
+        for name, raw_scopes in invalid:
+            with self.subTest(name=name):
+                with self.assertRaises(GwsMailAuthStatusError) as caught:
+                    parse_gws_auth_status(
+                        valid_gws_auth_status(scopes=raw_scopes)
+                    )
+                self.assertEqual(caught.exception.code, "gws_auth_scopes_invalid")
+                self.assertEqual(
+                    str(caught.exception),
+                    "The selected GWS OAuth scopes do not match the required Gmail read-only set.",
+                )
+
     def test_command_runner_rejects_malformed_status_without_raw_output(self) -> None:
         runner = GwsMailCommandRunner()
         raw = '{"secret":"raw-provider-detail"'
@@ -556,6 +633,25 @@ class GwsPolicyTests(unittest.TestCase):
                         "https://www.googleapis.com/auth/userinfo.email",
                         "https://www.googleapis.com/auth/userinfo.profile",
                         "https://www.googleapis.com/auth/drive.readonly",
+                    ]
+                ),
+                "gws_auth_scopes_invalid",
+                "The selected GWS OAuth scopes do not match the required Gmail read-only set.",
+            ),
+            (
+                "incomplete-echoed-alias-pair",
+                valid_gws_auth_status(
+                    scopes=[*valid_gws_auth_status()["scopes"], "email"]
+                ),
+                "gws_auth_scopes_invalid",
+                "The selected GWS OAuth scopes do not match the required Gmail read-only set.",
+            ),
+            (
+                "arbitrary-oidc-scope",
+                valid_gws_auth_status(
+                    scopes=[
+                        *valid_gws_auth_status()["scopes"],
+                        "raw-provider-detail-sensitive@example.test/private/sentinel",
                     ]
                 ),
                 "gws_auth_scopes_invalid",

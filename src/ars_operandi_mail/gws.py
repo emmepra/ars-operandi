@@ -53,6 +53,7 @@ GWS_REQUIRED_SCOPES = frozenset(
         "https://www.googleapis.com/auth/userinfo.profile",
     }
 )
+GWS_ECHOED_OIDC_SCOPE_ALIASES = frozenset({"email", "profile"})
 FORBIDDEN_QUERY_SELECTOR_PATTERNS = (
     r"\bOR\b",
     r"[{}|]",
@@ -584,8 +585,16 @@ def parse_gws_auth_status(payload: object) -> GwsAuthStatus:
         not isinstance(scope, str) or not scope for scope in raw_scopes
     ):
         raise GwsMailAuthStatusError("gws_auth_scopes_invalid")
-    scopes = frozenset(raw_scopes)
-    if scopes != GWS_REQUIRED_SCOPES:
+    unique_scopes: set[str] = set()
+    for scope in raw_scopes:
+        if scope in unique_scopes:
+            raise GwsMailAuthStatusError("gws_auth_scopes_invalid")
+        unique_scopes.add(scope)
+    scopes = frozenset(unique_scopes)
+    if scopes not in (
+        GWS_REQUIRED_SCOPES,
+        GWS_REQUIRED_SCOPES | GWS_ECHOED_OIDC_SCOPE_ALIASES,
+    ):
         raise GwsMailAuthStatusError("gws_auth_scopes_invalid")
 
     return GwsAuthStatus(
@@ -593,7 +602,7 @@ def parse_gws_auth_status(payload: object) -> GwsAuthStatus:
         storage=payload["storage"],
         keyring_backend=payload["keyring_backend"],
         credential_source=payload["credential_source"],
-        scopes=scopes,
+        scopes=GWS_REQUIRED_SCOPES,
     )
 
 
