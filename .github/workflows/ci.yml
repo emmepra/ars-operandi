@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - main
+  push:
+    branches:
+      - dev
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+      - name: Install locked dependencies
+        run: uv sync --locked --dev
+      - name: Run unit tests
+        run: uv run --no-sync python -m unittest discover -s tests -q
+      - name: Run Ruff
+        run: uv run --no-sync ruff check --select E4,E7,E9,F .
+      - name: Validate skills
+        run: uv run --no-sync python scripts/validate_skills.py
