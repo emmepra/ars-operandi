@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -859,6 +860,13 @@ class GwsPolicyTests(unittest.TestCase):
 
     def test_selected_content_is_normalized_and_attachment_is_explicit(self) -> None:
         calls: list[str] = []
+        html_body = (
+            base64.urlsafe_b64encode(
+                b'<p><a href="HTTPS://Docs.Example.TEST/start">Read docs</a></p>'
+            )
+            .decode("ascii")
+            .rstrip("=")
+        )
 
         class Runner:
             def status(self, *, env):
@@ -895,6 +903,37 @@ class GwsPolicyTests(unittest.TestCase):
                                 },
                                 {
                                     "partId": "1",
+                                    "mimeType": "text/html",
+                                    "filename": "",
+                                    "headers": [
+                                        {
+                                            "name": "Content-Type",
+                                            "value": "text/html; charset=utf-8",
+                                        }
+                                    ],
+                                    "body": {"data": html_body},
+                                },
+                                {
+                                    "partId": "2",
+                                    "mimeType": "image/png",
+                                    "filename": "logo.png",
+                                    "headers": [
+                                        {
+                                            "name": "Content-Disposition",
+                                            "value": "inline; filename=logo.png",
+                                        },
+                                        {
+                                            "name": "Content-ID",
+                                            "value": "<logo.1@example.test>",
+                                        },
+                                    ],
+                                    "body": {
+                                        "attachmentId": "provider-inline",
+                                        "size": 3,
+                                    },
+                                },
+                                {
+                                    "partId": "3",
                                     "mimeType": "application/pdf",
                                     "filename": "report.pdf",
                                     "headers": [],
@@ -921,7 +960,21 @@ class GwsPolicyTests(unittest.TestCase):
         )
         content = client.get_content("msg_1", max_bytes=1024).to_dict()
         self.assertEqual(content["content"]["text"], "Hello from Ars")
-        attachment_id = content["attachments"][0]["id"]
+        self.assertEqual(
+            content["content"]["links"],
+            [{"label": "Read docs", "target": "https://docs.example.test/start"}],
+        )
+        self.assertNotIn("href", content["content"]["html"])
+        inline = content["attachments"][0]
+        self.assertEqual(inline["disposition"], "inline")
+        self.assertEqual(inline["content_id"], "logo.1@example.test")
+        self.assertNotIn("provider-inline", repr(inline))
+        self.assertNotIn("provider-inline", repr(content))
+        self.assertNotIn(ATTACHMENT_GET_METHOD, calls)
+        self.assertEqual(
+            client.get_attachment("msg_1", inline["id"], max_bytes=10), b"PDF"
+        )
+        attachment_id = content["attachments"][1]["id"]
         self.assertNotIn("provider-att", attachment_id)
         self.assertEqual(
             client.get_attachment("msg_1", attachment_id, max_bytes=10), b"PDF"
@@ -932,6 +985,8 @@ class GwsPolicyTests(unittest.TestCase):
                 "auth.status",
                 "users.getProfile",
                 MESSAGE_GET_METHOD,
+                "users.getProfile",
+                ATTACHMENT_GET_METHOD,
                 "users.getProfile",
                 ATTACHMENT_GET_METHOD,
             ],
@@ -1441,9 +1496,15 @@ class ProtonSessionTests(unittest.TestCase):
     def test_selected_content_matches_schema_and_attachment_is_explicit(
         self,
     ) -> None:
+        html_source = b'<p><a href="HTTPS://Docs.Example.TEST/start">Read docs</a></p>'
+        html_encoded = base64.b64encode(html_source)
         structure = (
             b'(("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "BASE64" 20 1 '
             b"NIL NIL NIL NIL)"
+            + f'("TEXT" "HTML" ("CHARSET" "UTF-8") NIL NIL "BASE64" {len(html_source)} 1 '.encode()
+            + b"NIL NIL NIL NIL)"
+            + b'("IMAGE" "PNG" ("NAME" "logo.png") "<logo.1@example.test>" NIL "BASE64" 3 '
+            b'NIL ("INLINE" ("FILENAME" "logo.png")) NIL NIL) '
             b'("APPLICATION" "PDF" ("NAME" "report.pdf") NIL NIL "BASE64" 4 '
             b'NIL ("ATTACHMENT" ("FILENAME" "report.pdf")) NIL NIL) '
             b'"MIXED" ("BOUNDARY" "x") NIL NIL NIL)'
@@ -1466,7 +1527,9 @@ class ProtonSessionTests(unittest.TestCase):
                         part = match.group(1)
                         literal = {
                             "1": b"SGVsbG8gZnJvbSBBcnM=",
-                            "2": b"UERG",
+                            "2": html_encoded,
+                            "3": b"UE5H",
+                            "4": b"UERG",
                         }[part]
                         descriptor = (
                             f"1 (UID {uid} BODY[{part}] {{{len(literal)}}}"
@@ -1493,14 +1556,33 @@ class ProtonSessionTests(unittest.TestCase):
             content = client.get_content(message_id, max_bytes=1024).to_dict()
             self.assertEqual(content["content"]["text"], "Hello from Ars")
             self.assertTrue(content["untrusted"])
-            attachment_id = content["attachments"][0]["id"]
+            self.assertEqual(
+                content["content"]["links"],
+                [
+                    {
+                        "label": "Read docs",
+                        "target": "https://docs.example.test/start",
+                    }
+                ],
+            )
+            self.assertNotIn("href", content["content"]["html"])
+            inline = content["attachments"][0]
+            self.assertEqual(inline["disposition"], "inline")
+            self.assertEqual(inline["content_id"], "logo.1@example.test")
+            attachment_id = content["attachments"][1]["id"]
             before_attachment = repr(events)
-            self.assertNotIn("BODY.PEEK[2]", before_attachment)
+            self.assertNotIn("BODY.PEEK[3]", before_attachment)
+            self.assertNotIn("BODY.PEEK[4]", before_attachment)
+            self.assertEqual(
+                client.get_attachment(message_id, inline["id"], max_bytes=10),
+                b"PNG",
+            )
+            self.assertIn("BODY.PEEK[3]", repr(events))
             self.assertEqual(
                 client.get_attachment(message_id, attachment_id, max_bytes=10),
                 b"PDF",
             )
-            self.assertIn("BODY.PEEK[2]", repr(events))
+            self.assertIn("BODY.PEEK[4]", repr(events))
 
     def test_planned_binding_blocks_normal_read_before_secret(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
