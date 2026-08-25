@@ -31,8 +31,9 @@ from .mail_content import (
     decode_transfer_payload,
     html_to_text,
     sanitize_content_type,
+    sanitize_content_id,
     sanitize_filename,
-    sanitize_html,
+    sanitize_html_with_links,
     validate_attachment_max_bytes,
     validate_content_max_bytes,
 )
@@ -117,6 +118,8 @@ class _MimePart:
     size: int
     filename: str
     is_attachment: bool
+    disposition: str | None
+    content_id: str | None
 
 
 class _Deadline:
@@ -377,6 +380,8 @@ class ProtonBridgeMailClient:
                             filename=part.filename or "attachment",
                             content_type=part.content_type,
                             size=part.size,
+                            disposition=part.disposition,
+                            content_id=part.content_id,
                         )
                     )
                     continue
@@ -407,7 +412,11 @@ class ProtonBridgeMailClient:
             )
             text_truncated |= joined_text_truncated
             html_truncated |= joined_html_truncated
-            safe_html = sanitize_html(html_source) if html_values else ""
+            safe_html, links, links_truncated = (
+                sanitize_html_with_links(html_source)
+                if html_values
+                else ("", (), False)
+            )
             if not text and safe_html:
                 text = html_to_text(safe_html)
             return MessageContent(
@@ -421,6 +430,8 @@ class ProtonBridgeMailClient:
                 text_truncated=text_truncated,
                 html_truncated=html_truncated,
                 attachments=tuple(attachments),
+                links=links,
+                links_truncated=links_truncated,
             )
 
     def get_attachment(
@@ -929,6 +940,10 @@ def _mime_parts_from_bodystructure(raw: bytes) -> tuple[_MimePart, ...]:
                     disposition_params = _structure_params(value[1])
                 break
         filename = disposition_params.get("FILENAME") or params.get("NAME") or ""
+        raw_content_id = node[3]
+        if raw_content_id is not None and not isinstance(raw_content_id, str):
+            raise ProtonBridgeMailError("Proton Bridge MIME structure is invalid.")
+        content_id = sanitize_content_id(raw_content_id)
         content_type = sanitize_content_type(
             f"{media_type.casefold()}/{subtype.casefold()}"
         )
@@ -946,6 +961,8 @@ def _mime_parts_from_bodystructure(raw: bytes) -> tuple[_MimePart, ...]:
                 size=size,
                 filename=sanitize_filename(filename) if filename else "",
                 is_attachment=is_attachment,
+                disposition=disposition.casefold() if disposition else None,
+                content_id=content_id,
             )
         )
 

@@ -21,8 +21,10 @@ from .mail_content import (
     decode_text,
     html_to_text,
     sanitize_content_type,
+    sanitize_content_id,
+    sanitize_disposition,
     sanitize_filename,
-    sanitize_html,
+    sanitize_html_with_links,
     validate_attachment_max_bytes,
     validate_content_max_bytes,
 )
@@ -911,6 +913,8 @@ def _normalize_gmail_content(
             if part.get("filename")
             else ""
         )
+        disposition = sanitize_disposition(_gmail_header(part, "Content-Disposition"))
+        content_id = sanitize_content_id(_gmail_header(part, "Content-ID"))
         body = part.get("body", {})
         if not isinstance(body, dict):
             raise GwsMailError("Gmail content response is invalid.")
@@ -951,6 +955,8 @@ def _normalize_gmail_content(
                     filename=filename or "attachment",
                     content_type=mime_type,
                     size=size,
+                    disposition=disposition,
+                    content_id=content_id,
                 )
             )
             return
@@ -982,7 +988,9 @@ def _normalize_gmail_content(
     )
     text_truncated |= joined_text_truncated
     html_truncated |= joined_html_truncated
-    safe_html = sanitize_html(html_text) if html_text else ""
+    safe_html, links, links_truncated = (
+        sanitize_html_with_links(html_text) if html_text else ("", (), False)
+    )
     if not text and safe_html:
         text = html_to_text(safe_html)
     return MessageContent(
@@ -996,7 +1004,23 @@ def _normalize_gmail_content(
         text_truncated=text_truncated,
         html_truncated=html_truncated,
         attachments=tuple(attachments),
+        links=links,
+        links_truncated=links_truncated,
     )
+
+
+def _gmail_header(part: Mapping[str, object], name: str) -> str | None:
+    headers = part.get("headers", [])
+    if not isinstance(headers, list):
+        raise GwsMailError("Gmail content response is invalid.")
+    matches = [
+        item.get("value")
+        for item in headers
+        if isinstance(item, dict)
+        and str(item.get("name", "")).casefold() == name.casefold()
+        and isinstance(item.get("value"), str)
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _decode_gmail_data(value: str) -> bytes:
