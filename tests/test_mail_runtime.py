@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import json
 import os
 import re
 import subprocess
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import yaml
@@ -21,15 +25,22 @@ from ars_operandi_mail.config import (
 from ars_operandi_mail.gws import (
     ATTACHMENT_GET_METHOD,
     GmailReadRequest,
+    GwsAuthStatus,
+    GwsMailAuthStatusError,
     GwsMailClient,
+    GwsMailCommandRunner,
+    GwsMailError,
     GwsMailIdentityError,
     GwsMailPolicyError,
     MESSAGE_GET_METHOD,
+    MESSAGE_LIST_METHOD,
     MessageMetadata,
     OnboardingProbe,
     build_query,
     clean_gws_environment,
+    parse_gws_auth_status,
     validate_gmail_request,
+    validate_selected_environment,
 )
 from ars_operandi_mail.mail_content import AttachmentMetadata, MessageContent
 from ars_operandi_mail.proton import (
@@ -48,7 +59,12 @@ from ars_operandi_mail.proton import (
     _metadata_from_headers,
     _validate_max_results,
 )
-from ars_operandi_mail.service import MailRuntime, build_mcp, safe_tool_call
+from ars_operandi_mail.service import (
+    MailRuntime,
+    build_mcp,
+    safe_error_payload,
+    safe_tool_call,
+)
 
 
 def write_index(
@@ -118,6 +134,51 @@ def write_proton_config(
         encoding="utf-8",
     )
     return path
+
+
+def valid_gws_auth_status(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "auth_method": "oauth2",
+        "storage": "encrypted",
+        "keyring_backend": "keyring",
+        "client_config_exists": True,
+        "encrypted_credentials_exists": True,
+        "plain_credentials_exists": False,
+        "credential_source": "client_secret.json",
+        "project_id": "example-project",
+        "encryption_valid": True,
+        "has_refresh_token": True,
+        "token_valid": True,
+        "scopes": [
+            "openid",
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+@contextmanager
+def synthetic_gws_os_account(
+    home: Path,
+    *,
+    account_name: str = "local-user",
+    ambient: dict[str, str] | None = None,
+):
+    ambient_account = {
+        "HOME": str(home),
+        "USER": account_name,
+        "LOGNAME": account_name,
+    }
+    if ambient is not None:
+        ambient_account.update(ambient)
+    record = SimpleNamespace(pw_dir=str(home), pw_name=account_name)
+    with patch("ars_operandi_mail.gws.os.getuid", return_value=501), patch(
+        "ars_operandi_mail.gws.pwd.getpwuid", return_value=record
+    ), patch.dict(os.environ, ambient_account):
+        yield
 
 
 class FakeSecretBackend:
@@ -216,10 +277,602 @@ class ConfigTests(unittest.TestCase):
 
 
 class GwsPolicyTests(unittest.TestCase):
-    def test_selected_content_is_normalized_and_attachment_is_explicit(self) -> None:
-        calls: list[str] = []
+    def test_auth_invalidates_token_cache_before_identity_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            token_cache = config_dir / "token_cache.json"
+            token_cache.write_bytes(b"stale encrypted token")
+            events: list[str] = []
+
+            class Runner:
+                def auth(self, *, env):
+                    events.append("auth")
+
+                def status(self, *, env):
+                    if token_cache.exists():
+                        raise AssertionError("stale token cache reached status check")
+                    events.append("status")
+                    return valid_gws_auth_status()
+
+                def run_read(self, request, *, env):
+                    if token_cache.exists():
+                        raise AssertionError("stale token cache reached identity check")
+                    events.append(request.method)
+                    return {"emailAddress": "home@example.test"}
+
+            client = GwsMailClient(
+                GwsAccountConfig(
+                    alias="home",
+                    email="home@example.test",
+                    config_dir=config_dir,
+                    binding_state="verified",
+                ),
+                runner=Runner(),
+            )
+
+            client.auth()
+
+            self.assertEqual(events, ["auth", "status", "users.getProfile"])
+            self.assertFalse(token_cache.exists())
+
+    def test_auth_with_missing_token_cache_is_a_no_op(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+
+            class Runner:
+                def auth(self, *, env):
+                    return None
+
+                def status(self, *, env):
+                    return valid_gws_auth_status()
+
+                def run_read(self, request, *, env):
+                    return {"emailAddress": "home@example.test"}
+
+            client = GwsMailClient(
+                GwsAccountConfig(
+                    alias="home",
+                    email="home@example.test",
+                    config_dir=config_dir,
+                    binding_state="verified",
+                ),
+                runner=Runner(),
+            )
+
+            client.auth()
+
+    def test_failed_auth_preserves_existing_token_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            token_cache = config_dir / "token_cache.json"
+            token_cache.write_bytes(b"existing encrypted token")
+
+            class Runner:
+                def auth(self, *, env):
+                    raise GwsMailError("gws operation failed (exit code 2).")
+
+                def run_read(self, request, *, env):
+                    raise AssertionError("identity check must not run after failed auth")
+
+            client = GwsMailClient(
+                GwsAccountConfig(
+                    alias="home",
+                    email="home@example.test",
+                    config_dir=config_dir,
+                    binding_state="verified",
+                ),
+                runner=Runner(),
+            )
+
+            with self.assertRaises(GwsMailError):
+                client.auth()
+
+            self.assertEqual(token_cache.read_bytes(), b"existing encrypted token")
+
+    def test_cache_invalidation_failure_stops_before_identity_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            (config_dir / "token_cache.json").write_bytes(b"stale encrypted token")
+
+            class Runner:
+                def auth(self, *, env):
+                    return None
+
+                def status(self, *, env):
+                    raise AssertionError("status must not run with stale cache")
+
+                def run_read(self, request, *, env):
+                    raise AssertionError("identity check must not use stale cache")
+
+            client = GwsMailClient(
+                GwsAccountConfig(
+                    alias="home",
+                    email="home@example.test",
+                    config_dir=config_dir,
+                    binding_state="verified",
+                ),
+                runner=Runner(),
+            )
+
+            with patch.object(Path, "unlink", side_effect=PermissionError):
+                with self.assertRaisesRegex(GwsMailError, "token cache"):
+                    client.auth()
+
+    def test_command_runner_parses_status_json_without_retaining_sensitive_fields(
+        self,
+    ) -> None:
+        runner = GwsMailCommandRunner()
+        provider_payload = valid_gws_auth_status(
+            client_config="/private/sentinel/client.json",
+            config_client_id="sensitive-client-id",
+            project_id="sensitive-project-id",
+            token_env_var=False,
+            user="sensitive@example.test",
+        )
+        with patch.object(runner, "_run", return_value=json.dumps(provider_payload)):
+            status = runner.status(env={})
+
+        rendered = repr(status)
+        self.assertEqual(
+            status.scopes,
+            {
+                "openid",
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/userinfo.email",
+                "https://www.googleapis.com/auth/userinfo.profile",
+            },
+        )
+        self.assertNotIn("/private/sentinel", rendered)
+        self.assertNotIn("sensitive-client-id", rendered)
+        self.assertNotIn("sensitive-project-id", rendered)
+        self.assertNotIn("sensitive@example.test", rendered)
+
+    def test_scope_status_accepts_only_canonical_or_complete_echoed_alias_pair(
+        self,
+    ) -> None:
+        canonical = [
+            "openid",
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+        ]
+        accepted = (
+            list(reversed(canonical)),
+            [
+                "profile",
+                canonical[2],
+                "email",
+                canonical[0],
+                canonical[3],
+                canonical[1],
+            ],
+        )
+        for raw_scopes in accepted:
+            with self.subTest(raw_scopes=raw_scopes):
+                status = parse_gws_auth_status(
+                    valid_gws_auth_status(scopes=raw_scopes)
+                )
+                self.assertEqual(status.scopes, frozenset(canonical))
+                self.assertNotIn("email", status.scopes)
+                self.assertNotIn("profile", status.scopes)
+
+    def test_scope_status_rejects_closed_invalid_matrix(self) -> None:
+        canonical = [
+            "openid",
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+        ]
+        echoed = [*canonical, "email", "profile"]
+        invalid = (
+            ("duplicate-canonical", [*canonical, canonical[0]]),
+            ("duplicate-alias", [*echoed, "email"]),
+            ("email-only-alias", [*canonical, "email"]),
+            ("profile-only-alias", [*canonical, "profile"]),
+            (
+                "email-alias-replaces-canonical",
+                [canonical[0], canonical[1], canonical[3], "email", "profile"],
+            ),
+            (
+                "profile-alias-replaces-canonical",
+                [canonical[0], canonical[1], canonical[2], "email", "profile"],
+            ),
+            ("missing-required", canonical[1:]),
+            (
+                "mutative-gmail",
+                [*canonical, "https://www.googleapis.com/auth/gmail.modify"],
+            ),
+            ("full-gmail", [*canonical, "https://mail.google.com/"]),
+            (
+                "other-service",
+                [*canonical, "https://www.googleapis.com/auth/drive.readonly"],
+            ),
+            ("arbitrary-oidc", [*canonical, "offline_access"]),
+            ("non-list", tuple(canonical)),
+            ("empty-item", [*canonical, ""]),
+            ("non-string-item", [*canonical, 7]),
+        )
+        for name, raw_scopes in invalid:
+            with self.subTest(name=name):
+                with self.assertRaises(GwsMailAuthStatusError) as caught:
+                    parse_gws_auth_status(
+                        valid_gws_auth_status(scopes=raw_scopes)
+                    )
+                self.assertEqual(caught.exception.code, "gws_auth_scopes_invalid")
+                self.assertEqual(
+                    str(caught.exception),
+                    "The selected GWS OAuth scopes do not match the required Gmail read-only set.",
+                )
+
+    def test_command_runner_rejects_malformed_status_without_raw_output(self) -> None:
+        runner = GwsMailCommandRunner()
+        raw = '{"secret":"raw-provider-detail"'
+        with patch.object(runner, "_run", return_value=raw):
+            with self.assertRaises(GwsMailAuthStatusError) as caught:
+                runner.status(env={})
+
+        self.assertEqual(caught.exception.code, "gws_auth_status_invalid")
+        self.assertEqual(
+            str(caught.exception),
+            "The selected GWS authentication status is invalid.",
+        )
+        self.assertNotIn("raw-provider-detail", str(caught.exception))
+
+    def test_invalid_status_has_typed_sanitized_errors_and_never_reads_provider(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "schema",
+                {"auth_method": "oauth2"},
+                "gws_auth_status_invalid",
+                "The selected GWS authentication status is invalid.",
+            ),
+            (
+                "empty-project-id",
+                valid_gws_auth_status(project_id=""),
+                "gws_auth_status_invalid",
+                "The selected GWS authentication status is invalid.",
+            ),
+            (
+                "invalid-project-id-type",
+                valid_gws_auth_status(project_id=123),
+                "gws_auth_status_invalid",
+                "The selected GWS authentication status is invalid.",
+            ),
+            (
+                "invalid-token-env-flag-type",
+                valid_gws_auth_status(token_env_var="false"),
+                "gws_auth_status_invalid",
+                "The selected GWS authentication status is invalid.",
+            ),
+            (
+                "ambient-token-source",
+                valid_gws_auth_status(token_env_var=True),
+                "gws_auth_source_invalid",
+                "The selected GWS profile is not using the required encrypted OAuth source.",
+            ),
+            (
+                "backend",
+                valid_gws_auth_status(keyring_backend="file"),
+                "gws_auth_backend_invalid",
+                "The selected GWS profile is not using the required keyring backend.",
+            ),
+            (
+                "source",
+                valid_gws_auth_status(
+                    storage="plaintext",
+                    encrypted_credentials_exists=False,
+                    plain_credentials_exists=True,
+                    credential_source="environment_variables",
+                ),
+                "gws_auth_source_invalid",
+                "The selected GWS profile is not using the required encrypted OAuth source.",
+            ),
+            (
+                "decryption",
+                valid_gws_auth_status(encryption_valid=False),
+                "gws_auth_decryption_failed",
+                "The selected GWS encrypted credentials cannot be decrypted.",
+            ),
+            (
+                "invalid-client",
+                valid_gws_auth_status(
+                    token_valid=False,
+                    token_error=(
+                        "invalid_client raw-provider-detail sensitive@example.test "
+                        "/private/sentinel/client.json"
+                    ),
+                ),
+                "gws_auth_invalid_client",
+                "The selected GWS OAuth client is invalid.",
+            ),
+            (
+                "token",
+                valid_gws_auth_status(
+                    token_valid=False,
+                    token_error="provider token detail raw-provider-detail",
+                ),
+                "gws_auth_token_invalid",
+                "The selected GWS OAuth token is unavailable or invalid.",
+            ),
+            (
+                "refresh-token",
+                valid_gws_auth_status(has_refresh_token=False),
+                "gws_auth_token_invalid",
+                "The selected GWS OAuth token is unavailable or invalid.",
+            ),
+            (
+                "scopes",
+                valid_gws_auth_status(
+                    scopes=[
+                        "https://www.googleapis.com/auth/gmail.readonly",
+                        "https://www.googleapis.com/auth/gmail.modify",
+                    ]
+                ),
+                "gws_auth_scopes_invalid",
+                "The selected GWS OAuth scopes do not match the required Gmail read-only set.",
+            ),
+            (
+                "missing-provider-identity-scope",
+                valid_gws_auth_status(
+                    scopes=[
+                        "openid",
+                        "https://www.googleapis.com/auth/gmail.readonly",
+                        "https://www.googleapis.com/auth/userinfo.email",
+                    ]
+                ),
+                "gws_auth_scopes_invalid",
+                "The selected GWS OAuth scopes do not match the required Gmail read-only set.",
+            ),
+            (
+                "extra-service-scope",
+                valid_gws_auth_status(
+                    scopes=[
+                        "openid",
+                        "https://www.googleapis.com/auth/gmail.readonly",
+                        "https://www.googleapis.com/auth/userinfo.email",
+                        "https://www.googleapis.com/auth/userinfo.profile",
+                        "https://www.googleapis.com/auth/drive.readonly",
+                    ]
+                ),
+                "gws_auth_scopes_invalid",
+                "The selected GWS OAuth scopes do not match the required Gmail read-only set.",
+            ),
+            (
+                "incomplete-echoed-alias-pair",
+                valid_gws_auth_status(
+                    scopes=[*valid_gws_auth_status()["scopes"], "email"]
+                ),
+                "gws_auth_scopes_invalid",
+                "The selected GWS OAuth scopes do not match the required Gmail read-only set.",
+            ),
+            (
+                "arbitrary-oidc-scope",
+                valid_gws_auth_status(
+                    scopes=[
+                        *valid_gws_auth_status()["scopes"],
+                        "raw-provider-detail-sensitive@example.test/private/sentinel",
+                    ]
+                ),
+                "gws_auth_scopes_invalid",
+                "The selected GWS OAuth scopes do not match the required Gmail read-only set.",
+            ),
+        )
+        runtime = MailRuntime(
+            project_index=Path("/tmp/nonexistent-project-index"),
+            config_root=Path("/tmp/nonexistent-mail-config"),
+        )
+
+        for name, status_payload, code, message in cases:
+            with self.subTest(name=name):
+                reads: list[str] = []
+
+                class Runner:
+                    def status(self, *, env):
+                        return status_payload
+
+                    def run_read(self, request, *, env):
+                        reads.append(request.method)
+                        raise AssertionError("provider read must not start")
+
+                client = GwsMailClient(
+                    GwsAccountConfig(
+                        alias="home",
+                        email="home@example.test",
+                        config_dir=Path("/tmp/home"),
+                        binding_state="verified",
+                    ),
+                    runner=Runner(),
+                )
+
+                with self.assertRaises(GwsMailAuthStatusError) as caught:
+                    client.status()
+                result = safe_error_payload(runtime, caught.exception)
+
+                self.assertEqual(reads, [])
+                self.assertEqual(result, {"code": code, "message": message})
+                rendered = repr(result)
+                self.assertNotIn("raw-provider-detail", rendered)
+                self.assertNotIn("sensitive@example.test", rendered)
+                self.assertNotIn("/private/sentinel", rendered)
+
+    def test_valid_status_precedes_exact_identity_provider_read(self) -> None:
+        events: list[str] = []
 
         class Runner:
+            def status(self, *, env):
+                events.append("auth.status")
+                return valid_gws_auth_status()
+
+            def run_read(self, request, *, env):
+                events.append(request.method)
+                return {"emailAddress": "home@example.test"}
+
+        client = GwsMailClient(
+            GwsAccountConfig(
+                alias="home",
+                email="home@example.test",
+                config_dir=Path("/tmp/home"),
+                binding_state="verified",
+            ),
+            runner=Runner(),
+        )
+
+        self.assertTrue(client.status())
+        self.assertEqual(events, ["auth.status", "users.getProfile"])
+
+    def test_parser_rejects_safe_dataclass_but_client_accepts_runner_result(self) -> None:
+        status = GwsAuthStatus(
+            auth_method="oauth2",
+            storage="encrypted",
+            keyring_backend="keyring",
+            credential_source="client_secret.json",
+            scopes=frozenset(
+                {
+                    "openid",
+                    "https://www.googleapis.com/auth/gmail.readonly",
+                    "https://www.googleapis.com/auth/userinfo.email",
+                    "https://www.googleapis.com/auth/userinfo.profile",
+                }
+            ),
+        )
+        with self.assertRaises(GwsMailAuthStatusError) as caught:
+            parse_gws_auth_status(status)
+        self.assertEqual(caught.exception.code, "gws_auth_status_invalid")
+
+        class Runner:
+            def status(self, *, env):
+                return status
+
+            def run_read(self, request, *, env):
+                return {"emailAddress": "home@example.test"}
+
+        client = GwsMailClient(
+            GwsAccountConfig(
+                alias="home",
+                email="home@example.test",
+                config_dir=Path("/tmp/home"),
+                binding_state="verified",
+            ),
+            runner=Runner(),
+        )
+        self.assertTrue(client.status())
+
+    def test_multi_message_search_preflights_status_once_per_client(self) -> None:
+        events: list[str] = []
+
+        class Runner:
+            def status(self, *, env):
+                events.append("auth.status")
+                return valid_gws_auth_status()
+
+            def run_read(self, request, *, env):
+                events.append(request.method)
+                if request.method == "users.getProfile":
+                    return {"emailAddress": "home@example.test"}
+                if request.method == MESSAGE_LIST_METHOD:
+                    return {"messages": [{"id": "msg_1"}, {"id": "msg_2"}]}
+                if request.method == MESSAGE_GET_METHOD:
+                    return {
+                        "id": request.params["id"],
+                        "payload": {"headers": []},
+                    }
+                raise AssertionError(request.method)
+
+        account = GwsAccountConfig(
+            alias="home",
+            email="home@example.test",
+            config_dir=Path("/tmp/home"),
+            binding_state="verified",
+        )
+        client = GwsMailClient(account, runner=Runner())
+
+        messages = client.search(
+            query="",
+            after="2026-07-01",
+            before="2026-07-02",
+            max_results=2,
+        )
+
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(events.count("auth.status"), 1)
+
+        second_client = GwsMailClient(account, runner=Runner())
+        self.assertTrue(second_client.status())
+        self.assertEqual(events.count("auth.status"), 2)
+
+    def test_auth_rechecks_status_after_cached_preflight(self) -> None:
+        events: list[str] = []
+
+        class Runner:
+            def auth(self, *, env):
+                events.append("auth")
+
+            def status(self, *, env):
+                events.append("auth.status")
+                return valid_gws_auth_status()
+
+            def run_read(self, request, *, env):
+                events.append(request.method)
+                return {"emailAddress": "home@example.test"}
+
+        client = GwsMailClient(
+            GwsAccountConfig(
+                alias="home",
+                email="home@example.test",
+                config_dir=Path("/tmp/home"),
+                binding_state="verified",
+            ),
+            runner=Runner(),
+        )
+        self.assertTrue(client.status())
+        events.clear()
+
+        client.auth()
+
+        self.assertEqual(events, ["auth", "auth.status", "users.getProfile"])
+
+    def test_invalid_status_blocks_normal_mailbox_read_before_provider(self) -> None:
+        reads: list[str] = []
+
+        class Runner:
+            def status(self, *, env):
+                return valid_gws_auth_status(encryption_valid=False)
+
+            def run_read(self, request, *, env):
+                reads.append(request.method)
+                raise AssertionError("provider read must not start")
+
+        client = GwsMailClient(
+            GwsAccountConfig(
+                alias="home",
+                email="home@example.test",
+                config_dir=Path("/tmp/home"),
+                binding_state="verified",
+            ),
+            runner=Runner(),
+        )
+
+        with self.assertRaises(GwsMailAuthStatusError):
+            client.get_metadata("msg_1")
+        self.assertEqual(reads, [])
+
+    def test_selected_content_is_normalized_and_attachment_is_explicit(self) -> None:
+        calls: list[str] = []
+        html_body = (
+            base64.urlsafe_b64encode(
+                b'<p><a href="HTTPS://Docs.Example.TEST/start">Read docs</a></p>'
+            )
+            .decode("ascii")
+            .rstrip("=")
+        )
+
+        class Runner:
+            def status(self, *, env):
+                calls.append("auth.status")
+                return valid_gws_auth_status()
+
             def run_read(self, request, *, env):
                 calls.append(request.method)
                 if request.method == "users.getProfile":
@@ -250,6 +903,37 @@ class GwsPolicyTests(unittest.TestCase):
                                 },
                                 {
                                     "partId": "1",
+                                    "mimeType": "text/html",
+                                    "filename": "",
+                                    "headers": [
+                                        {
+                                            "name": "Content-Type",
+                                            "value": "text/html; charset=utf-8",
+                                        }
+                                    ],
+                                    "body": {"data": html_body},
+                                },
+                                {
+                                    "partId": "2",
+                                    "mimeType": "image/png",
+                                    "filename": "logo.png",
+                                    "headers": [
+                                        {
+                                            "name": "Content-Disposition",
+                                            "value": "inline; filename=logo.png",
+                                        },
+                                        {
+                                            "name": "Content-ID",
+                                            "value": "<logo.1@example.test>",
+                                        },
+                                    ],
+                                    "body": {
+                                        "attachmentId": "provider-inline",
+                                        "size": 3,
+                                    },
+                                },
+                                {
+                                    "partId": "3",
                                     "mimeType": "application/pdf",
                                     "filename": "report.pdf",
                                     "headers": [],
@@ -276,7 +960,21 @@ class GwsPolicyTests(unittest.TestCase):
         )
         content = client.get_content("msg_1", max_bytes=1024).to_dict()
         self.assertEqual(content["content"]["text"], "Hello from Ars")
-        attachment_id = content["attachments"][0]["id"]
+        self.assertEqual(
+            content["content"]["links"],
+            [{"label": "Read docs", "target": "https://docs.example.test/start"}],
+        )
+        self.assertNotIn("href", content["content"]["html"])
+        inline = content["attachments"][0]
+        self.assertEqual(inline["disposition"], "inline")
+        self.assertEqual(inline["content_id"], "logo.1@example.test")
+        self.assertNotIn("provider-inline", repr(inline))
+        self.assertNotIn("provider-inline", repr(content))
+        self.assertNotIn(ATTACHMENT_GET_METHOD, calls)
+        self.assertEqual(
+            client.get_attachment("msg_1", inline["id"], max_bytes=10), b"PDF"
+        )
+        attachment_id = content["attachments"][1]["id"]
         self.assertNotIn("provider-att", attachment_id)
         self.assertEqual(
             client.get_attachment("msg_1", attachment_id, max_bytes=10), b"PDF"
@@ -284,8 +982,11 @@ class GwsPolicyTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
+                "auth.status",
                 "users.getProfile",
                 MESSAGE_GET_METHOD,
+                "users.getProfile",
+                ATTACHMENT_GET_METHOD,
                 "users.getProfile",
                 ATTACHMENT_GET_METHOD,
             ],
@@ -328,12 +1029,359 @@ class GwsPolicyTests(unittest.TestCase):
             )
 
     def test_ambient_google_credentials_are_rejected(self) -> None:
-        with patch.dict(os.environ, {"GOOGLE_APPLICATION_CREDENTIALS": "/tmp/x"}):
-            with self.assertRaises(GwsMailPolicyError):
-                clean_gws_environment(Path("/tmp/gws"))
+        for name in (
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_WORKSPACE_CLI_TOKEN",
+            "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE",
+            "GOOGLE_WORKSPACE_CLI_CLIENT_ID",
+            "GOOGLE_WORKSPACE_CLI_CLIENT_SECRET",
+            "GOOGLE_WORKSPACE_CLI_ACCOUNT",
+        ):
+            with self.subTest(name=name):
+                with patch.dict(os.environ, {name: "sensitive-value"}):
+                    with self.assertRaises(GwsMailPolicyError) as caught:
+                        clean_gws_environment(Path("/tmp/gws"))
+                self.assertEqual(
+                    str(caught.exception),
+                    "Ambient Google credential override is forbidden.",
+                )
+                self.assertNotIn("sensitive-value", str(caught.exception))
+
+    def test_gws_environment_preserves_real_home_and_injects_missing_sentinel(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real-home"
+            real_home.mkdir()
+            adc = real_home / ".config/gcloud/application_default_credentials.json"
+            adc.parent.mkdir(parents=True)
+            adc.touch()
+            profile = Path(tmp) / "selected-profile"
+            noncanonical_home = real_home / ".." / "real-home"
+            with synthetic_gws_os_account(noncanonical_home):
+                env = clean_gws_environment(profile)
+                selected = profile.resolve()
+                sentinel = Path(env["GOOGLE_APPLICATION_CREDENTIALS"])
+                self.assertEqual(env["HOME"], str(real_home.resolve()))
+                self.assertEqual(env["USER"], "local-user")
+                self.assertEqual(env["LOGNAME"], "local-user")
+                self.assertEqual(
+                    env["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"], str(selected)
+                )
+                self.assertTrue(sentinel.is_absolute())
+                self.assertEqual(sentinel.parent, selected)
+                self.assertFalse(sentinel.exists())
+                self.assertEqual(validate_selected_environment(env), env)
+
+    def test_ambient_os_account_environment_must_match_account_database(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real-home"
+            other_home = root / "other-home"
+            real_home.mkdir()
+            other_home.mkdir()
+            mismatches = (
+                {"HOME": str(other_home)},
+                {"USER": "other-user"},
+                {"LOGNAME": "other-user"},
+            )
+            for ambient in mismatches:
+                with self.subTest(ambient=ambient), synthetic_gws_os_account(
+                    real_home, ambient=ambient
+                ):
+                    with self.assertRaises(GwsMailPolicyError) as caught:
+                        clean_gws_environment(root / "selected-profile")
+                    self.assertEqual(
+                        str(caught.exception),
+                        "The ambient OS account environment for gws is invalid.",
+                    )
+                    rendered = str(caught.exception)
+                    self.assertNotIn(str(real_home), rendered)
+                    self.assertNotIn(str(other_home), rendered)
+                    self.assertNotIn("other-user", rendered)
+
+    def test_invalid_os_account_database_record_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing_home = root / "missing-home"
+            loop = root / "home-loop"
+            loop.symlink_to(loop)
+            invalid_records = (
+                None,
+                SimpleNamespace(pw_dir="relative-home", pw_name="local-user"),
+                SimpleNamespace(pw_dir=str(missing_home), pw_name="local-user"),
+                SimpleNamespace(pw_dir=str(root), pw_name=""),
+                SimpleNamespace(pw_dir=str(loop), pw_name="local-user"),
+            )
+            for record in invalid_records:
+                with self.subTest(record=record), patch(
+                    "ars_operandi_mail.gws.os.getuid", return_value=501
+                ), patch(
+                    "ars_operandi_mail.gws.pwd.getpwuid", return_value=record
+                ):
+                    with self.assertRaises(GwsMailPolicyError) as caught:
+                        clean_gws_environment(root / "selected-profile")
+                    self.assertEqual(
+                        str(caught.exception),
+                        "The local OS account for gws is invalid.",
+                    )
+                    self.assertNotIn(str(root), str(caught.exception))
+
+            with patch("ars_operandi_mail.gws.os.getuid", return_value=501), patch(
+                "ars_operandi_mail.gws.pwd.getpwuid", side_effect=KeyError
+            ):
+                with self.assertRaises(GwsMailPolicyError) as caught:
+                    clean_gws_environment(root / "selected-profile")
+            self.assertEqual(
+                str(caught.exception),
+                "The local OS account for gws is invalid.",
+            )
+
+    def test_selected_environment_rejects_home_config_or_sentinel_drift(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real-home"
+            real_home.mkdir()
+            profile = root / "selected-profile"
+            with synthetic_gws_os_account(real_home):
+                valid = clean_gws_environment(profile)
+                validate_selected_environment(valid)
+                selected = valid["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"]
+                arbitrary_sentinel = str(profile / "arbitrary-adc.json")
+                invalid = (
+                    {**valid, "HOME": str(root / "different-home")},
+                    {**valid, "USER": "different-user"},
+                    {**valid, "LOGNAME": "different-user"},
+                    {
+                        **valid,
+                        "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": "relative-profile",
+                    },
+                    {
+                        **valid,
+                        "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": (
+                            f"{selected}/../selected-profile"
+                        ),
+                    },
+                    {
+                        **valid,
+                        "GOOGLE_APPLICATION_CREDENTIALS": arbitrary_sentinel,
+                    },
+                    {
+                        key: value
+                        for key, value in valid.items()
+                        if key != "GOOGLE_APPLICATION_CREDENTIALS"
+                    },
+                )
+                for env in invalid:
+                    with self.subTest(env=env):
+                        with self.assertRaises(GwsMailPolicyError) as caught:
+                            validate_selected_environment(env)
+                        rendered = str(caught.exception)
+                        self.assertNotIn(str(profile), rendered)
+                        self.assertNotIn(arbitrary_sentinel, rendered)
+                        self.assertNotIn("different-user", rendered)
+
+    def test_missing_sentinel_allows_status_read_and_auth_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real-home"
+            real_home.mkdir()
+            profile = root / "selected-profile"
+            with synthetic_gws_os_account(real_home):
+                env = clean_gws_environment(profile)
+                runner = GwsMailCommandRunner()
+                completed = (
+                    subprocess.CompletedProcess(
+                        [], 0, stdout=json.dumps(valid_gws_auth_status())
+                    ),
+                    subprocess.CompletedProcess(
+                        [], 0, stdout=json.dumps({"emailAddress": "home@example.test"})
+                    ),
+                    subprocess.CompletedProcess([], 0),
+                )
+                with patch(
+                    "ars_operandi_mail.gws.shutil.which", return_value="/bin/gws"
+                ), patch(
+                    "ars_operandi_mail.gws.subprocess.run", side_effect=completed
+                ) as launch:
+                    runner.status(env=env)
+                    self.assertEqual(
+                        runner.run_read(
+                            GmailReadRequest("users.getProfile", {"userId": "me"}),
+                            env=env,
+                        ),
+                        {"emailAddress": "home@example.test"},
+                    )
+                    runner.auth(env=env)
+                self.assertEqual(launch.call_count, 3)
+                for call in launch.call_args_list:
+                    self.assertEqual(
+                        call.kwargs["env"]["GOOGLE_APPLICATION_CREDENTIALS"],
+                        env["GOOGLE_APPLICATION_CREDENTIALS"],
+                    )
+
+    def test_preexec_gate_rejects_existing_sentinel_for_all_processes(self) -> None:
+        for kind in ("file", "directory", "symlink"):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    real_home = root / "real-home"
+                    real_home.mkdir()
+                    profile = root / "selected-profile"
+                    profile.mkdir()
+                    with synthetic_gws_os_account(real_home):
+                        env = clean_gws_environment(profile)
+                        self.assertEqual(validate_selected_environment(env), env)
+                        sentinel = Path(env["GOOGLE_APPLICATION_CREDENTIALS"])
+                        if kind == "file":
+                            sentinel.touch()
+                        elif kind == "directory":
+                            sentinel.mkdir()
+                        else:
+                            sentinel.symlink_to(profile / "missing-target")
+                        runner = GwsMailCommandRunner()
+                        actions = (
+                            lambda: runner.status(env=env),
+                            lambda: runner.run_read(
+                                GmailReadRequest(
+                                    "users.getProfile", {"userId": "me"}
+                                ),
+                                env=env,
+                            ),
+                            lambda: runner.auth(env=env),
+                        )
+                        with patch("ars_operandi_mail.gws.subprocess.run") as launch:
+                            for action in actions:
+                                with self.assertRaises(GwsMailPolicyError) as caught:
+                                    action()
+                                self.assertEqual(
+                                    str(caught.exception),
+                                    "GWS plaintext or ADC fallback credentials are forbidden.",
+                                )
+                                rendered = str(caught.exception)
+                                self.assertNotIn(str(profile), rendered)
+                                self.assertNotIn(str(sentinel), rendered)
+                        launch.assert_not_called()
+
+    def test_preexec_gate_keeps_profile_plaintext_credentials_forbidden(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real-home"
+            real_home.mkdir()
+            profile = root / "selected-profile"
+            profile.mkdir()
+            with synthetic_gws_os_account(real_home):
+                env = clean_gws_environment(profile)
+                (profile / "credentials.json").touch()
+                runner = GwsMailCommandRunner()
+                with patch("ars_operandi_mail.gws.subprocess.run") as launch:
+                    with self.assertRaises(GwsMailPolicyError) as caught:
+                        runner.status(env=env)
+                launch.assert_not_called()
+                self.assertEqual(
+                    str(caught.exception),
+                    "GWS plaintext or ADC fallback credentials are forbidden.",
+                )
+
+    def test_preexec_gate_fails_closed_when_sentinel_lstat_fails(self) -> None:
+        original_lstat = Path.lstat
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real-home"
+            real_home.mkdir()
+            profile = root / "selected-profile"
+            profile.mkdir()
+            with synthetic_gws_os_account(real_home):
+                env = clean_gws_environment(profile)
+                sentinel = Path(env["GOOGLE_APPLICATION_CREDENTIALS"])
+
+                def controlled_lstat(candidate: Path):
+                    if candidate == sentinel:
+                        raise PermissionError("sensitive filesystem detail")
+                    return original_lstat(candidate)
+
+                runner = GwsMailCommandRunner()
+                with patch.object(Path, "lstat", new=controlled_lstat), patch(
+                    "ars_operandi_mail.gws.subprocess.run"
+                ) as launch:
+                    with self.assertRaises(GwsMailPolicyError) as caught:
+                        runner.status(env=env)
+                launch.assert_not_called()
+                self.assertEqual(
+                    str(caught.exception),
+                    "GWS plaintext or ADC fallback credentials are forbidden.",
+                )
+                self.assertNotIn(str(sentinel), str(caught.exception))
+                self.assertNotIn("sensitive filesystem detail", str(caught.exception))
+
+    def test_cached_status_cannot_bypass_preexec_fallback_gate(self) -> None:
+        safe_status = GwsAuthStatus(
+            auth_method="oauth2",
+            storage="encrypted",
+            keyring_backend="keyring",
+            credential_source="client_secret.json",
+            scopes=frozenset(
+                {
+                    "openid",
+                    "https://www.googleapis.com/auth/gmail.readonly",
+                    "https://www.googleapis.com/auth/userinfo.email",
+                    "https://www.googleapis.com/auth/userinfo.profile",
+                }
+            ),
+        )
+
+        class PrimedRunner(GwsMailCommandRunner):
+            def __init__(self) -> None:
+                super().__init__()
+                self.status_calls = 0
+
+            def status(self, *, env):
+                self.status_calls += 1
+                return safe_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_home = root / "real-home"
+            real_home.mkdir()
+            profile = root / "selected-profile"
+            profile.mkdir()
+            runner = PrimedRunner()
+            client = GwsMailClient(
+                GwsAccountConfig(
+                    alias="home",
+                    email="home@example.test",
+                    config_dir=profile,
+                    binding_state="verified",
+                ),
+                runner=runner,
+            )
+            with synthetic_gws_os_account(real_home):
+                client._require_safe_auth_status()
+                sentinel = Path(
+                    client._env()["GOOGLE_APPLICATION_CREDENTIALS"]
+                )
+                sentinel.touch()
+                with patch("ars_operandi_mail.gws.subprocess.run") as launch:
+                    with self.assertRaises(GwsMailPolicyError) as caught:
+                        client.verify_identity()
+
+        self.assertEqual(runner.status_calls, 1)
+        launch.assert_not_called()
+        self.assertEqual(
+            str(caught.exception),
+            "GWS plaintext or ADC fallback credentials are forbidden.",
+        )
 
     def test_exact_gws_identity_mismatch_fails_closed(self) -> None:
         class Runner:
+            def status(self, *, env):
+                return valid_gws_auth_status()
+
             def run_read(self, request, *, env):
                 return {"emailAddress": "other@example.test"}
 
@@ -346,8 +1394,27 @@ class GwsPolicyTests(unittest.TestCase):
             ),
             runner=Runner(),
         )
-        with self.assertRaises(GwsMailIdentityError):
+        with self.assertRaises(GwsMailIdentityError) as caught:
             client.verify_identity()
+        self.assertEqual(caught.exception.code, "gws_identity_mismatch")
+        self.assertEqual(
+            str(caught.exception),
+            "The selected GWS profile identity does not match the configured account.",
+        )
+        runtime = MailRuntime(
+            project_index=Path("/tmp/nonexistent-project-index"),
+            config_root=Path("/tmp/nonexistent-mail-config"),
+        )
+        self.assertEqual(
+            safe_error_payload(runtime, caught.exception),
+            {
+                "code": "gws_identity_mismatch",
+                "message": (
+                    "The selected GWS profile identity does not match the configured "
+                    "account."
+                ),
+            },
+        )
 
 
 class ProtonSessionTests(unittest.TestCase):
@@ -429,9 +1496,15 @@ class ProtonSessionTests(unittest.TestCase):
     def test_selected_content_matches_schema_and_attachment_is_explicit(
         self,
     ) -> None:
+        html_source = b'<p><a href="HTTPS://Docs.Example.TEST/start">Read docs</a></p>'
+        html_encoded = base64.b64encode(html_source)
         structure = (
             b'(("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "BASE64" 20 1 '
             b"NIL NIL NIL NIL)"
+            + f'("TEXT" "HTML" ("CHARSET" "UTF-8") NIL NIL "BASE64" {len(html_source)} 1 '.encode()
+            + b"NIL NIL NIL NIL)"
+            + b'("IMAGE" "PNG" ("NAME" "logo.png") "<logo.1@example.test>" NIL "BASE64" 3 '
+            b'NIL ("INLINE" ("FILENAME" "logo.png")) NIL NIL) '
             b'("APPLICATION" "PDF" ("NAME" "report.pdf") NIL NIL "BASE64" 4 '
             b'NIL ("ATTACHMENT" ("FILENAME" "report.pdf")) NIL NIL) '
             b'"MIXED" ("BOUNDARY" "x") NIL NIL NIL)'
@@ -454,7 +1527,9 @@ class ProtonSessionTests(unittest.TestCase):
                         part = match.group(1)
                         literal = {
                             "1": b"SGVsbG8gZnJvbSBBcnM=",
-                            "2": b"UERG",
+                            "2": html_encoded,
+                            "3": b"UE5H",
+                            "4": b"UERG",
                         }[part]
                         descriptor = (
                             f"1 (UID {uid} BODY[{part}] {{{len(literal)}}}"
@@ -481,14 +1556,33 @@ class ProtonSessionTests(unittest.TestCase):
             content = client.get_content(message_id, max_bytes=1024).to_dict()
             self.assertEqual(content["content"]["text"], "Hello from Ars")
             self.assertTrue(content["untrusted"])
-            attachment_id = content["attachments"][0]["id"]
+            self.assertEqual(
+                content["content"]["links"],
+                [
+                    {
+                        "label": "Read docs",
+                        "target": "https://docs.example.test/start",
+                    }
+                ],
+            )
+            self.assertNotIn("href", content["content"]["html"])
+            inline = content["attachments"][0]
+            self.assertEqual(inline["disposition"], "inline")
+            self.assertEqual(inline["content_id"], "logo.1@example.test")
+            attachment_id = content["attachments"][1]["id"]
             before_attachment = repr(events)
-            self.assertNotIn("BODY.PEEK[2]", before_attachment)
+            self.assertNotIn("BODY.PEEK[3]", before_attachment)
+            self.assertNotIn("BODY.PEEK[4]", before_attachment)
+            self.assertEqual(
+                client.get_attachment(message_id, inline["id"], max_bytes=10),
+                b"PNG",
+            )
+            self.assertIn("BODY.PEEK[3]", repr(events))
             self.assertEqual(
                 client.get_attachment(message_id, attachment_id, max_bytes=10),
                 b"PDF",
             )
-            self.assertIn("BODY.PEEK[2]", repr(events))
+            self.assertIn("BODY.PEEK[4]", repr(events))
 
     def test_planned_binding_blocks_normal_read_before_secret(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -735,6 +1829,31 @@ class RuntimeAndMcpTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"safe")
             self.assertEqual(receipt["byte_count"], 4)
             self.assertNotIn("output_path", receipt)
+
+    def test_success_payload_preserves_selected_content_without_error_redaction(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = self.runtime(Path(tmp))
+            text = ("Line one\nLine two password=mail-value " * 80).strip()
+            html = "<p>" + ("Selected body " * 160) + "</p>"
+            payload = {
+                "message": {
+                    "content": {
+                        "text": text,
+                        "html": html,
+                        "text_truncated": False,
+                        "html_truncated": False,
+                    }
+                }
+            }
+
+            result = safe_tool_call(runtime, lambda: payload)
+
+        self.assertEqual(result["message"]["content"]["text"], text)
+        self.assertEqual(result["message"]["content"]["html"], html)
+        self.assertFalse(result["message"]["content"]["text_truncated"])
+        self.assertFalse(result["message"]["content"]["html_truncated"])
 
     def test_process_runtime_reuses_one_keychain_resolution_across_operations(
         self,

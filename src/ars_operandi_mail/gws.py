@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -20,8 +21,10 @@ from .mail_content import (
     decode_text,
     html_to_text,
     sanitize_content_type,
+    sanitize_content_id,
+    sanitize_disposition,
     sanitize_filename,
-    sanitize_html,
+    sanitize_html_with_links,
     validate_attachment_max_bytes,
     validate_content_max_bytes,
 )
@@ -35,6 +38,24 @@ MAX_HEADER_VALUE_LENGTH = 1000
 MAX_MESSAGE_ID_LENGTH = 256
 NONINTERACTIVE_TIMEOUT_SECONDS = 15
 KEYRING_BACKEND = "keyring"
+TOKEN_CACHE_FILENAME = "token_cache.json"
+ADC_DENIAL_SENTINEL_FILENAME = ".ars-operandi-adc-denied.json"
+FALLBACK_CREDENTIAL_ERROR_MESSAGE = (
+    "GWS plaintext or ADC fallback credentials are forbidden."
+)
+OS_ACCOUNT_ERROR_MESSAGE = "The local OS account for gws is invalid."
+OS_ACCOUNT_ENV_ERROR_MESSAGE = (
+    "The ambient OS account environment for gws is invalid."
+)
+GWS_REQUIRED_SCOPES = frozenset(
+    {
+        "openid",
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+    }
+)
+GWS_ECHOED_OIDC_SCOPE_ALIASES = frozenset({"email", "profile"})
 FORBIDDEN_QUERY_SELECTOR_PATTERNS = (
     r"\bOR\b",
     r"[{}|]",
@@ -54,6 +75,9 @@ FORBIDDEN_CREDENTIAL_ENV_VARS = frozenset(
     {
         "GOOGLE_WORKSPACE_CLI_TOKEN",
         "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE",
+        "GOOGLE_WORKSPACE_CLI_CLIENT_ID",
+        "GOOGLE_WORKSPACE_CLI_CLIENT_SECRET",
+        "GOOGLE_WORKSPACE_CLI_ACCOUNT",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "GOOGLE_GHA_CREDS_PATH",
         "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
@@ -78,7 +102,11 @@ SAFE_SUBPROCESS_ENV_VARS = frozenset(
     }
 )
 SELECTED_GWS_ENV_VARS = frozenset(
-    {"GOOGLE_WORKSPACE_CLI_CONFIG_DIR", "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"}
+    {
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_WORKSPACE_CLI_CONFIG_DIR",
+        "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND",
+    }
 )
 
 
@@ -90,14 +118,65 @@ class GwsMailPolicyError(GwsMailError):
     """Raised before subprocess execution for a forbidden Gmail request."""
 
 
+GWS_AUTH_ERROR_MESSAGES = {
+    "gws_auth_status_invalid": "The selected GWS authentication status is invalid.",
+    "gws_auth_backend_invalid": (
+        "The selected GWS profile is not using the required keyring backend."
+    ),
+    "gws_auth_source_invalid": (
+        "The selected GWS profile is not using the required encrypted OAuth source."
+    ),
+    "gws_auth_decryption_failed": (
+        "The selected GWS encrypted credentials cannot be decrypted."
+    ),
+    "gws_auth_invalid_client": "The selected GWS OAuth client is invalid.",
+    "gws_auth_token_invalid": (
+        "The selected GWS OAuth token is unavailable or invalid."
+    ),
+    "gws_auth_scopes_invalid": (
+        "The selected GWS OAuth scopes do not match the required Gmail read-only set."
+    ),
+}
+
+
+class GwsMailAuthStatusError(GwsMailError):
+    """Stable, sanitized failure derived from structured GWS auth status."""
+
+    def __init__(self, code: str) -> None:
+        try:
+            message = GWS_AUTH_ERROR_MESSAGES[code]
+        except KeyError as exc:  # pragma: no cover - internal closed catalog
+            raise ValueError("Unknown GWS authentication error code.") from exc
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
 class GwsMailIdentityError(GwsMailError):
     """Raised when the selected Gmail identity cannot be proven exactly."""
+
+    code = "gws_identity_mismatch"
+    message = (
+        "The selected GWS profile identity does not match the configured account."
+    )
+
+    def __init__(self) -> None:
+        super().__init__(self.message)
 
 
 @dataclass(frozen=True)
 class GmailReadRequest:
     method: str
     params: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class GwsAuthStatus:
+    auth_method: str
+    storage: str
+    keyring_backend: str
+    credential_source: str
+    scopes: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -166,9 +245,13 @@ class GwsMailCommandRunner:
             ["auth", "login", "--readonly", "--services", "gmail"], env=env
         )
 
-    def status(self, *, env: Mapping[str, str]) -> bool:
-        self._run(["auth", "status"], env=env)
-        return True
+    def status(self, *, env: Mapping[str, str]) -> GwsAuthStatus:
+        stdout = self._run(["auth", "status"], env=env)
+        try:
+            payload = json.loads(stdout)
+        except (json.JSONDecodeError, TypeError):
+            raise GwsMailAuthStatusError("gws_auth_status_invalid") from None
+        return parse_gws_auth_status(payload)
 
     def _run(self, args: list[str], *, env: Mapping[str, str]) -> str:
         clean_env = validate_selected_environment(env)
@@ -213,27 +296,40 @@ class GwsMailClient:
     def __init__(self, account: GwsAccountConfig, runner: Any | None = None) -> None:
         self.account = account
         self.runner = runner or GwsMailCommandRunner()
+        self._auth_status: GwsAuthStatus | None = None
 
     def auth(self) -> None:
+        self._auth_status = None
         self.account.config_dir.mkdir(parents=True, exist_ok=True)
         self.runner.auth(env=self._env())
+        invalidate_gws_token_cache(self.account.config_dir)
+        self._auth_status = None
         self.verify_identity()
 
     def status(self) -> bool:
-        if not self.runner.status(env=self._env()):
-            raise GwsMailError("gws authentication is unavailable.")
         self.verify_identity()
         return True
 
     def verify_identity(self) -> IdentityCheck:
+        self._require_safe_auth_status()
         response = self.runner.run_read(
             GmailReadRequest(PROFILE_METHOD, {"userId": "me"}), env=self._env()
         )
         if not isinstance(response, dict):
-            raise GwsMailIdentityError("Gmail identity response is invalid.")
+            raise GwsMailIdentityError()
         if response.get("emailAddress") != self.account.email:
-            raise GwsMailIdentityError("Gmail profile identity mismatch.")
+            raise GwsMailIdentityError()
         return IdentityCheck(alias=self.account.alias)
+
+    def _require_safe_auth_status(self) -> GwsAuthStatus:
+        if self._auth_status is None:
+            status = self.runner.status(env=self._env())
+            self._auth_status = (
+                status
+                if isinstance(status, GwsAuthStatus)
+                else parse_gws_auth_status(status)
+            )
+        return self._auth_status
 
     def search(
         self, *, query: str, after: str, before: str, max_results: int
@@ -430,6 +526,88 @@ def validate_gmail_request(request: GmailReadRequest) -> None:
     _validate_message_id(message_id)
 
 
+def parse_gws_auth_status(payload: object) -> GwsAuthStatus:
+    """Validate the selected profile's GWS status without retaining sensitive fields."""
+
+    if not isinstance(payload, dict):
+        raise GwsMailAuthStatusError("gws_auth_status_invalid")
+
+    string_fields = ("auth_method", "storage", "keyring_backend", "credential_source")
+    boolean_fields = (
+        "client_config_exists",
+        "encrypted_credentials_exists",
+        "plain_credentials_exists",
+    )
+    if any(not isinstance(payload.get(name), str) for name in string_fields) or any(
+        not isinstance(payload.get(name), bool) for name in boolean_fields
+    ):
+        raise GwsMailAuthStatusError("gws_auth_status_invalid")
+    project_id = payload.get("project_id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise GwsMailAuthStatusError("gws_auth_status_invalid")
+    if "token_env_var" in payload and not isinstance(payload["token_env_var"], bool):
+        raise GwsMailAuthStatusError("gws_auth_status_invalid")
+
+    if payload["keyring_backend"] != KEYRING_BACKEND:
+        raise GwsMailAuthStatusError("gws_auth_backend_invalid")
+    if (
+        payload["auth_method"] != "oauth2"
+        or payload["storage"] != "encrypted"
+        or payload["credential_source"] != "client_secret.json"
+        or payload["client_config_exists"] is not True
+        or payload["encrypted_credentials_exists"] is not True
+        or payload["plain_credentials_exists"] is not False
+        or payload.get("token_env_var") is True
+    ):
+        raise GwsMailAuthStatusError("gws_auth_source_invalid")
+
+    encryption_valid = payload.get("encryption_valid")
+    if not isinstance(encryption_valid, bool):
+        raise GwsMailAuthStatusError("gws_auth_status_invalid")
+    if not encryption_valid:
+        raise GwsMailAuthStatusError("gws_auth_decryption_failed")
+
+    has_refresh_token = payload.get("has_refresh_token")
+    if not isinstance(has_refresh_token, bool):
+        raise GwsMailAuthStatusError("gws_auth_status_invalid")
+    if not has_refresh_token:
+        raise GwsMailAuthStatusError("gws_auth_token_invalid")
+
+    token_valid = payload.get("token_valid")
+    if not isinstance(token_valid, bool):
+        raise GwsMailAuthStatusError("gws_auth_token_invalid")
+    if not token_valid:
+        token_error = payload.get("token_error")
+        if isinstance(token_error, str) and _is_invalid_client_error(token_error):
+            raise GwsMailAuthStatusError("gws_auth_invalid_client")
+        raise GwsMailAuthStatusError("gws_auth_token_invalid")
+
+    raw_scopes = payload.get("scopes")
+    if not isinstance(raw_scopes, list) or any(
+        not isinstance(scope, str) or not scope for scope in raw_scopes
+    ):
+        raise GwsMailAuthStatusError("gws_auth_scopes_invalid")
+    unique_scopes: set[str] = set()
+    for scope in raw_scopes:
+        if scope in unique_scopes:
+            raise GwsMailAuthStatusError("gws_auth_scopes_invalid")
+        unique_scopes.add(scope)
+    scopes = frozenset(unique_scopes)
+    if scopes not in (
+        GWS_REQUIRED_SCOPES,
+        GWS_REQUIRED_SCOPES | GWS_ECHOED_OIDC_SCOPE_ALIASES,
+    ):
+        raise GwsMailAuthStatusError("gws_auth_scopes_invalid")
+
+    return GwsAuthStatus(
+        auth_method=payload["auth_method"],
+        storage=payload["storage"],
+        keyring_backend=payload["keyring_backend"],
+        credential_source=payload["credential_source"],
+        scopes=GWS_REQUIRED_SCOPES,
+    )
+
+
 def build_query(*, query: str, after: str, before: str) -> str:
     start = _parse_date_bound(after, option="after")
     end = _parse_date_bound(before, option="before")
@@ -521,14 +699,31 @@ def sanitize_message_metadata(response: object, *, expected_id: str) -> MessageM
 
 def clean_gws_environment(config_dir: Path) -> dict[str, str]:
     reject_ambient_credential_overrides()
+    account_home, account_name = _canonical_os_account()
+    selected_dir = config_dir.expanduser().resolve()
     clean = {
         name: value
         for name in SAFE_SUBPROCESS_ENV_VARS
         if (value := os.environ.get(name)) is not None
     }
-    clean["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] = str(config_dir)
+    clean["HOME"] = str(account_home)
+    clean["LOGNAME"] = account_name
+    clean["USER"] = account_name
+    clean["GOOGLE_APPLICATION_CREDENTIALS"] = str(
+        _adc_denial_sentinel(selected_dir)
+    )
+    clean["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] = str(selected_dir)
     clean["GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"] = KEYRING_BACKEND
     return clean
+
+
+def invalidate_gws_token_cache(config_dir: Path) -> None:
+    """Remove derived access-token state after a successful OAuth login."""
+
+    try:
+        (config_dir / TOKEN_CACHE_FILENAME).unlink(missing_ok=True)
+    except OSError as exc:
+        raise GwsMailError("gws token cache could not be invalidated.") from exc
 
 
 def reject_ambient_credential_overrides() -> None:
@@ -541,17 +736,110 @@ def validate_selected_environment(env: Mapping[str, str]) -> dict[str, str]:
     allowed = SAFE_SUBPROCESS_ENV_VARS | SELECTED_GWS_ENV_VARS
     if set(env) - allowed:
         raise GwsMailPolicyError("Unexpected environment variable for gws.")
-    if not env.get("GOOGLE_WORKSPACE_CLI_CONFIG_DIR"):
+    selected_dir = env.get("GOOGLE_WORKSPACE_CLI_CONFIG_DIR")
+    if not isinstance(selected_dir, str) or not selected_dir:
         raise GwsMailPolicyError("Selected gws config directory is missing.")
+    selected_path = Path(selected_dir)
+    if (
+        not selected_path.is_absolute()
+        or str(selected_path.resolve()) != selected_dir
+    ):
+        raise GwsMailPolicyError("Selected gws config directory is invalid.")
+    account_home, account_name = _canonical_os_account()
+    if (
+        env.get("HOME") != str(account_home)
+        or env.get("USER") != account_name
+        or env.get("LOGNAME") != account_name
+    ):
+        raise GwsMailPolicyError(OS_ACCOUNT_ENV_ERROR_MESSAGE)
+    expected_sentinel = str(_adc_denial_sentinel(selected_path))
+    if env.get("GOOGLE_APPLICATION_CREDENTIALS") != expected_sentinel:
+        raise GwsMailPolicyError("Selected gws ADC denial sentinel is invalid.")
+    _reject_fallback_credential_artifacts(selected_path)
     if env.get("GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND") != KEYRING_BACKEND:
         raise GwsMailPolicyError("gws keyring backend is not enforced.")
     return dict(env)
+
+
+def _reject_fallback_credential_artifacts(selected_dir: Path) -> None:
+    candidates = (
+        selected_dir / "credentials.json",
+        _adc_denial_sentinel(selected_dir),
+    )
+    for candidate in candidates:
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise GwsMailPolicyError(FALLBACK_CREDENTIAL_ERROR_MESSAGE) from None
+        raise GwsMailPolicyError(FALLBACK_CREDENTIAL_ERROR_MESSAGE)
+
+
+def _adc_denial_sentinel(selected_dir: Path) -> Path:
+    return selected_dir / ADC_DENIAL_SENTINEL_FILENAME
+
+
+def _canonical_os_account() -> tuple[Path, str]:
+    try:
+        record = pwd.getpwuid(os.getuid())
+        home_value = record.pw_dir
+        account_name = record.pw_name
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        raise GwsMailPolicyError(OS_ACCOUNT_ERROR_MESSAGE) from None
+    if (
+        not isinstance(home_value, str)
+        or not home_value
+        or not isinstance(account_name, str)
+        or not account_name
+        or account_name.strip() != account_name
+        or any(character.isspace() for character in account_name)
+        or "/" in account_name
+        or ":" in account_name
+        or "\x00" in account_name
+    ):
+        raise GwsMailPolicyError(OS_ACCOUNT_ERROR_MESSAGE)
+    account_home = Path(home_value)
+    if not account_home.is_absolute():
+        raise GwsMailPolicyError(OS_ACCOUNT_ERROR_MESSAGE)
+    try:
+        account_home = account_home.resolve(strict=True)
+        if not account_home.is_dir():
+            raise GwsMailPolicyError(OS_ACCOUNT_ERROR_MESSAGE)
+    except (OSError, RuntimeError):
+        raise GwsMailPolicyError(OS_ACCOUNT_ERROR_MESSAGE) from None
+
+    ambient_home = os.environ.get("HOME")
+    if ambient_home is not None:
+        ambient_path = Path(ambient_home)
+        try:
+            if (
+                not ambient_path.is_absolute()
+                or ambient_path.resolve(strict=True) != account_home
+            ):
+                raise GwsMailPolicyError(OS_ACCOUNT_ENV_ERROR_MESSAGE)
+        except (OSError, RuntimeError):
+            raise GwsMailPolicyError(OS_ACCOUNT_ENV_ERROR_MESSAGE) from None
+    if any(
+        (value := os.environ.get(name)) is not None and value != account_name
+        for name in ("USER", "LOGNAME")
+    ):
+        raise GwsMailPolicyError(OS_ACCOUNT_ENV_ERROR_MESSAGE)
+    return account_home, account_name
 
 
 def _query_uses_forbidden_selector(query: str) -> bool:
     return any(
         re.search(pattern, query, flags=re.IGNORECASE)
         for pattern in FORBIDDEN_QUERY_SELECTOR_PATTERNS
+    )
+
+
+def _is_invalid_client_error(value: str) -> bool:
+    normalized = " ".join(value.casefold().split())
+    return (
+        "invalid_client" in normalized
+        or "oauth client was not found" in normalized
     )
 
 
@@ -625,6 +913,8 @@ def _normalize_gmail_content(
             if part.get("filename")
             else ""
         )
+        disposition = sanitize_disposition(_gmail_header(part, "Content-Disposition"))
+        content_id = sanitize_content_id(_gmail_header(part, "Content-ID"))
         body = part.get("body", {})
         if not isinstance(body, dict):
             raise GwsMailError("Gmail content response is invalid.")
@@ -665,6 +955,8 @@ def _normalize_gmail_content(
                     filename=filename or "attachment",
                     content_type=mime_type,
                     size=size,
+                    disposition=disposition,
+                    content_id=content_id,
                 )
             )
             return
@@ -696,7 +988,9 @@ def _normalize_gmail_content(
     )
     text_truncated |= joined_text_truncated
     html_truncated |= joined_html_truncated
-    safe_html = sanitize_html(html_text) if html_text else ""
+    safe_html, links, links_truncated = (
+        sanitize_html_with_links(html_text) if html_text else ("", (), False)
+    )
     if not text and safe_html:
         text = html_to_text(safe_html)
     return MessageContent(
@@ -710,7 +1004,23 @@ def _normalize_gmail_content(
         text_truncated=text_truncated,
         html_truncated=html_truncated,
         attachments=tuple(attachments),
+        links=links,
+        links_truncated=links_truncated,
     )
+
+
+def _gmail_header(part: Mapping[str, object], name: str) -> str | None:
+    headers = part.get("headers", [])
+    if not isinstance(headers, list):
+        raise GwsMailError("Gmail content response is invalid.")
+    matches = [
+        item.get("value")
+        for item in headers
+        if isinstance(item, dict)
+        and str(item.get("name", "")).casefold() == name.casefold()
+        and isinstance(item.get("value"), str)
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _decode_gmail_data(value: str) -> bytes:
