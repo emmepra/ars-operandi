@@ -128,12 +128,16 @@ class InstallerTests(unittest.TestCase):
             'command = "uv"\n'
             'args = ["run", "--script", "legacy", '
             '"op://Example/linear-a/credential"]\n'
-            "enabled = true\n\n"
+            "enabled = true\n"
+            'default_tools_approval_mode = "writes"\n'
+            "startup_timeout_sec = 60.0\n\n"
             "[mcp_servers.linear-old-b]\n"
             'command = "uv"\n'
             'args = ["run", "--script", "legacy", '
             '"op://Example/linear-b/credential"]\n'
-            "enabled = true\n\n"
+            "enabled = true\n"
+            'default_tools_approval_mode = "writes"\n'
+            "startup_timeout_sec = 60.0\n\n"
             f"{installer.LEGACY_BLOCK_END}\n"
         ).encode("utf-8")
         base = INITIAL_CONFIG
@@ -169,7 +173,7 @@ class InstallerTests(unittest.TestCase):
         marker_path.chmod(0o600)
         return original_config
 
-    def make_recovery_preimage(self) -> bytes:
+    def make_recovery_preimage(self, *, historical_policy_order: bool = True) -> bytes:
         exact_v2 = self.make_legacy_install()
         marker = json.loads(
             (self.destination / installer.MARKER_NAME).read_text(encoding="utf-8")
@@ -193,7 +197,11 @@ class InstallerTests(unittest.TestCase):
             ).encode()
             for index, alias in enumerate(ALIASES)
         )
-        paused = installer._paused_legacy_body(marker)
+        paused = (
+            installer._historical_paused_legacy_body(marker)
+            if historical_policy_order
+            else installer._paused_legacy_body(marker)
+        )
         interleaved = (
             b"[mcp_servers.unrelated-between]\n"
             b'command = "preserved"\n\n'
@@ -690,6 +698,12 @@ class InstallerTests(unittest.TestCase):
     ) -> None:
         original = self.make_recovery_preimage()
         legacy_before = self.snapshot(self.destination)
+        self.assertEqual(
+            original.count(
+                b'startup_timeout_sec = 60.0\ndefault_tools_approval_mode = "writes"\n'
+            ),
+            2,
+        )
 
         dry_result, dry, rendered = self.invoke(self.args("recover-migrate"))
 
@@ -754,6 +768,21 @@ class InstallerTests(unittest.TestCase):
         self,
     ) -> None:
         original = self.make_recovery_preimage()
+        marker = json.loads(
+            (self.destination / installer.MARKER_NAME).read_text(encoding="utf-8")
+        )
+        paused = installer._historical_paused_legacy_body(marker)
+        paused_start = original.index(paused)
+
+        def mutate_paused(old: bytes, new: bytes) -> bytes:
+            changed = paused.replace(old, new, 1)
+            self.assertNotEqual(changed, paused)
+            return (
+                original[:paused_start]
+                + changed
+                + original[paused_start + len(paused) :]
+            )
+
         variants = {
             "begin-restored": original.replace(
                 b"# END ars-operandi official-linear-mcp-bridge connections v2",
@@ -761,6 +790,18 @@ class InstallerTests(unittest.TestCase):
                 b"# END ars-operandi official-linear-mcp-bridge connections v2",
             ),
             "active-canary": original.replace(b"enabled = false", b"enabled = true", 1),
+            "one-sided-policy-order": mutate_paused(
+                b'startup_timeout_sec = 60.0\ndefault_tools_approval_mode = "writes"\n',
+                b'default_tools_approval_mode = "writes"\nstartup_timeout_sec = 60.0\n',
+            ),
+            "other-policy-reorder": mutate_paused(
+                b"enabled = false\nstartup_timeout_sec = 60.0\n",
+                b"startup_timeout_sec = 60.0\nenabled = false\n",
+            ),
+            "policy-value-drift": mutate_paused(
+                b'default_tools_approval_mode = "writes"',
+                b'default_tools_approval_mode = "reads"',
+            ),
             "floating-runtime": original.replace(
                 b"ars-operandi-1.0.0", b"ars-operandi-1.0.1", 1
             ),
@@ -808,6 +849,22 @@ class InstallerTests(unittest.TestCase):
                 self.assertNotIn("private", rendered)
                 self.assertEqual(self.config.read_bytes(), candidate)
                 self.assertFalse(self.state_path.exists())
+
+    def test_recovery_migration_still_accepts_canonical_paused_field_order(
+        self,
+    ) -> None:
+        original = self.make_recovery_preimage(historical_policy_order=False)
+
+        result, payload, rendered = self.invoke(self.args("recover-migrate"))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(payload["mode"], "dry-run")
+        self.assertEqual(
+            payload["preimage_sha256"], hashlib.sha256(original).hexdigest()
+        )
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertFalse(self.state_path.exists())
+        self.assert_redacted(rendered)
 
     def test_recovery_apply_failure_removes_private_copy_and_restores_preimage(
         self,

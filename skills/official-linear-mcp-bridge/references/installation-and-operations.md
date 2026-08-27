@@ -68,8 +68,13 @@ No OAuth login, Linear request, process action, or Codex reload occurs inside mi
 accepts only an unchanged installer-managed v2 skill and marker together with
 this exact historical composite config preimage:
 
-- the v2 begin marker is absent, its exact contiguous canary tables are paused,
-  and exactly one orphan end-marker line follows unrelated preserved tables;
+- the v2 begin marker is absent and its contiguous canary tables have exactly
+  one of two admitted paused forms: (1) byte-exact marker-derived tables with
+  only `enabled = true` changed to `enabled = false`; or (2) that same form plus
+  the identical adjacent swap placing `startup_timeout_sec` immediately before
+  `default_tools_approval_mode` in both canaries. No TOML normalization or
+  generalized field reordering is performed. Exactly one orphan end-marker line
+  follows unrelated preserved tables;
 - exactly two explicitly requested final aliases form a contiguous pair of
   effective-enabled tables using an absolute command ending in the pinned
   `mcp-remote/ars-operandi-1.0.0/node_modules/.bin/mcp-remote` runtime, the

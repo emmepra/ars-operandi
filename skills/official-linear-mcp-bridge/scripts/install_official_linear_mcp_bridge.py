@@ -865,6 +865,22 @@ def _paused_legacy_body(legacy: Mapping[str, Any]) -> bytes:
     return paused.replace(enabled, b"enabled = false\n")
 
 
+def _historical_paused_legacy_body(legacy: Mapping[str, Any]) -> bytes:
+    paused = _paused_legacy_body(legacy)
+    canonical_policy = (
+        b'default_tools_approval_mode = "writes"\nstartup_timeout_sec = 60.0\n'
+    )
+    historical_policy = (
+        b'startup_timeout_sec = 60.0\ndefault_tools_approval_mode = "writes"\n'
+    )
+    expected = len(_parse_legacy_connections(legacy["connections"]))
+    if paused.count(canonical_policy) != expected:
+        raise InstallError(
+            "legacy_state_invalid", "The legacy managed config segment is invalid."
+        )
+    return paused.replace(canonical_policy, historical_policy)
+
+
 def _remove_ranges(data: bytes, ranges: list[tuple[int, int]]) -> bytes:
     ordered = sorted(ranges)
     if any(start < 0 or end <= start for start, end in ordered) or any(
@@ -900,11 +916,20 @@ def _recovery_plan(
             "recovery_preimage_invalid",
             "The orphaned legacy marker shape is not exact.",
         )
-    paused_legacy = _paused_legacy_body(legacy)
-    if current.count(paused_legacy) != 1:
+    paused_candidates = (
+        _paused_legacy_body(legacy),
+        _historical_paused_legacy_body(legacy),
+    )
+    matching_paused = [
+        candidate
+        for candidate in dict.fromkeys(paused_candidates)
+        if current.count(candidate) == 1
+    ]
+    if len(matching_paused) != 1:
         raise InstallError(
             "recovery_preimage_invalid", "The paused legacy residue is not exact."
         )
+    paused_legacy = matching_paused[0]
     paused_start = current.index(paused_legacy)
     paused_range = (paused_start, paused_start + len(paused_legacy))
     end_start = current.index(end_line)
