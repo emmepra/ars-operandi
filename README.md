@@ -10,7 +10,7 @@ It complements Ora et Labora. Ora et Labora defines the repo-first workflow: iss
 | --- | --- |
 | `codex-thread-manager` | User-facing Codex app thread creation, naming, verification, and project/workstream coordination |
 | `mailctl-email-access` | Fail-closed, bounded GWS or Proton search, selected content, and attachment access through the canonical Ars mail MCP and CLI |
-| `dual-linear-mcp` | Fail-closed, manifest-driven Linear routing across independently authenticated workspaces |
+| `official-linear-mcp-bridge` | Two native official Linear OAuth/keyring aliases, exact staged migration, bounded recovery, restore, and finalization |
 | `openrouter-ops` | OpenRouter workspace/key operations, ephemeral runtime key injection, and safe revoke/rotate workflows |
 | `railway-deploy` | Railway deployment, release, variables, services, Postgres links, domains, smoke checks, and rollback notes |
 
@@ -33,7 +33,7 @@ cp -R skills/codex-thread-manager ~/.codex/skills/
 cp -R skills/openrouter-ops ~/.codex/skills/
 ```
 
-`dual-linear-mcp` includes a dry-run-first installer that also manages the fixed `dual-linear` MCP alias. See its [installation reference](skills/dual-linear-mcp/references/installation-and-operations.md); do not manually copy it and separately register a competing config.
+`official-linear-mcp-bridge` retains its legacy name so its dry-run-first installer can migrate or recover only proven prior state before retiring the old runtime. See its [installation reference](skills/official-linear-mcp-bridge/references/installation-and-operations.md); do not manually rewrite the managed Linear config.
 
 `mailctl-email-access` includes the canonical runtime in this repository and a
 dry-run-first installer for the skill plus the fixed `ars-mail` MCP alias. See
