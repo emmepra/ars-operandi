@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import tomllib
 import uuid
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -26,6 +28,11 @@ LEGACY_MARKER_VERSION = 2
 MARKER_MODE = 0o600
 STATE_MODE = 0o700
 STAGED_STATE_NAME = ".ars-operandi-official-linear-native-v3"
+RECOVERY_PREIMAGE_NAME = "recovery-preimage.toml"
+RECOVERY_PREIMAGE_MODE = 0o600
+MCP_REMOTE_COMMAND_SUFFIX = (
+    "/mcp-remote/ars-operandi-1.0.0/node_modules/.bin/mcp-remote"
+)
 LINEAR_MCP_ENDPOINT = "https://mcp.linear.app/mcp"
 BLOCK_BEGIN = "# BEGIN ars-operandi official-linear native connections v3"
 BLOCK_END = "# END ars-operandi official-linear native connections v3"
@@ -224,6 +231,105 @@ def _parse_config_bytes(data: bytes) -> Mapping[str, Any]:
         ) from exc
 
 
+def _assert_recovery_preimage_unchanged(path: Path, data: bytes, mode: int) -> None:
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or path.read_bytes() != data
+        or stat.S_IMODE(path.stat().st_mode) != mode
+    ):
+        raise InstallError(
+            "recovery_preimage_changed",
+            "The recovery preimage changed after planning; refusing mutation.",
+        )
+
+
+def _assert_locked_config_exact(
+    path: Path, descriptor: int, data: bytes, mode: int
+) -> None:
+    descriptor_stat = os.fstat(descriptor)
+    try:
+        path_stat = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise InstallError(
+            "recovery_preimage_changed",
+            "The recovery config changed at commit time; refusing mutation.",
+        ) from exc
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    descriptor_data = b""
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        descriptor_data += chunk
+    if (
+        not stat.S_ISREG(descriptor_stat.st_mode)
+        or (descriptor_stat.st_dev, descriptor_stat.st_ino)
+        != (path_stat.st_dev, path_stat.st_ino)
+        or descriptor_data != data
+        or path.read_bytes() != data
+        or stat.S_IMODE(path_stat.st_mode) != mode
+    ):
+        raise InstallError(
+            "recovery_preimage_changed",
+            "The recovery config changed at commit time; refusing mutation.",
+        )
+
+
+@contextmanager
+def _locked_config(path: Path, data: bytes, mode: int):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise InstallError(
+            "recovery_preimage_changed",
+            "The recovery config is unavailable at commit time.",
+        ) from exc
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _assert_locked_config_exact(path, descriptor, data, mode)
+        yield descriptor
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _atomic_compare_and_write(
+    path: Path,
+    expected: bytes,
+    expected_mode: int,
+    desired: bytes,
+    desired_mode: int,
+) -> None:
+    with _locked_config(path, expected, expected_mode) as descriptor:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=path.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(temporary_descriptor, "wb") as handle:
+                handle.write(desired)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, desired_mode)
+            _replace_locked_config(temporary, path, descriptor, expected, expected_mode)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def _replace_locked_config(
+    temporary: Path,
+    path: Path,
+    descriptor: int,
+    expected: bytes,
+    expected_mode: int,
+) -> None:
+    _assert_locked_config_exact(path, descriptor, expected, expected_mode)
+    os.replace(temporary, path)
+
+
 def _mcp_servers(parsed: Mapping[str, Any]) -> Mapping[str, Any]:
     value = parsed.get("mcp_servers", {})
     if not isinstance(value, Mapping):
@@ -306,6 +412,7 @@ def _result(
     status: str,
     aliases: tuple[str, str],
     actions: list[str] | None = None,
+    preimage_sha256: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ok": True,
@@ -316,6 +423,8 @@ def _result(
     }
     if actions is not None:
         payload["actions"] = actions
+    if preimage_sha256 is not None:
+        payload["preimage_sha256"] = preimage_sha256
     return payload
 
 
@@ -329,6 +438,9 @@ def _marker_payload(
     lifecycle: str,
     legacy_marker_sha256: str | None = None,
     legacy_segment_sha256: str | None = None,
+    recovery_preimage_sha256: str | None = None,
+    recovery_preimage_mode: int | None = None,
+    recovery_native_sha256: str | None = None,
 ) -> dict[str, Any]:
     return {
         "installer": MARKER_ID,
@@ -347,6 +459,9 @@ def _marker_payload(
         "lifecycle": lifecycle,
         "legacy_marker_sha256": legacy_marker_sha256,
         "legacy_segment_sha256": legacy_segment_sha256,
+        "recovery_preimage_sha256": recovery_preimage_sha256,
+        "recovery_preimage_mode": recovery_preimage_mode,
+        "recovery_native_sha256": recovery_native_sha256,
     }
 
 
@@ -449,6 +564,26 @@ def _validate_v3_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise InstallError(
             "managed_state_drift", "The native keyring state is invalid."
         )
+    recovery_values = (
+        payload.get("recovery_preimage_sha256"),
+        payload.get("recovery_preimage_mode"),
+        payload.get("recovery_native_sha256"),
+    )
+    if any(value is not None for value in recovery_values):
+        preimage_hash, preimage_mode, native_hash = recovery_values
+        if (
+            lifecycle != "staged-v2"
+            or not isinstance(preimage_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", preimage_hash)
+            or not isinstance(native_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", native_hash)
+            or not isinstance(preimage_mode, int)
+            or preimage_mode < 0
+            or preimage_mode > 0o777
+        ):
+            raise InstallError(
+                "managed_state_drift", "The recovery installer state is invalid."
+            )
     normalized = dict(payload)
     normalized["normalized_aliases"] = aliases
     return normalized
@@ -501,8 +636,7 @@ def _load_staged_state(path: Path) -> dict[str, Any] | None:
         raise InstallError(
             "managed_state_drift", "The staged migration state is unavailable."
         )
-    files = [item for item in path.iterdir()]
-    if files != [path / MARKER_NAME] or stat.S_IMODE(path.stat().st_mode) != STATE_MODE:
+    if stat.S_IMODE(path.stat().st_mode) != STATE_MODE:
         raise InstallError(
             "managed_state_drift", "The staged migration state has drifted."
         )
@@ -517,6 +651,30 @@ def _load_staged_state(path: Path) -> dict[str, Any] | None:
         raise InstallError(
             "managed_state_drift", "The staged migration marker is invalid."
         )
+    recovery_hash = normalized.get("recovery_preimage_sha256")
+    expected_names = {MARKER_NAME}
+    if recovery_hash is not None:
+        expected_names.add(RECOVERY_PREIMAGE_NAME)
+    if {item.name for item in path.iterdir()} != expected_names:
+        raise InstallError(
+            "managed_state_drift", "The staged migration state has drifted."
+        )
+    if recovery_hash is not None:
+        preimage_path = path / RECOVERY_PREIMAGE_NAME
+        if (
+            preimage_path.is_symlink()
+            or not preimage_path.is_file()
+            or stat.S_IMODE(preimage_path.stat().st_mode) != RECOVERY_PREIMAGE_MODE
+        ):
+            raise InstallError(
+                "managed_state_drift", "The recovery rollback copy has drifted."
+            )
+        preimage = preimage_path.read_bytes()
+        if hashlib.sha256(preimage).hexdigest() != recovery_hash:
+            raise InstallError(
+                "managed_state_drift", "The recovery rollback copy has drifted."
+            )
+        normalized["recovery_preimage"] = preimage
     return normalized
 
 
@@ -565,6 +723,239 @@ def _assert_native_config_exact(
         )
 
 
+def _table_spans(data: bytes) -> dict[str, tuple[int, int]]:
+    any_header = re.compile(
+        rb"(?m)^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#[^\r\n]*)?\r?$"
+    )
+    mcp_header = re.compile(
+        rb"^[ \t]*\[mcp_servers\.([a-z0-9-]+)\][ \t]*(?:#[^\r\n]*)?\r?$"
+    )
+    nested_header = re.compile(
+        rb"^[ \t]*\[mcp_servers\.([a-z0-9-]+)\.[^\]\r\n]+\][ \t]*(?:#[^\r\n]*)?\r?$"
+    )
+    matches = list(any_header.finditer(data))
+    spans: dict[str, tuple[int, int]] = {}
+    for index, match in enumerate(matches):
+        owned = mcp_header.fullmatch(match.group(0))
+        if owned is None:
+            continue
+        alias = owned.group(1).decode("ascii")
+        if alias in spans:
+            raise InstallError(
+                "recovery_preimage_invalid", "The recovery alias tables are ambiguous."
+            )
+        next_index = index + 1
+        while next_index < len(matches):
+            nested = nested_header.fullmatch(matches[next_index].group(0))
+            if nested is None or nested.group(1) != owned.group(1):
+                break
+            next_index += 1
+        end = matches[next_index].start() if next_index < len(matches) else len(data)
+        spans[alias] = (match.start(), end)
+    return spans
+
+
+def _assert_safe_rollback_segment(segment: bytes) -> None:
+    lowered = segment.lower()
+    forbidden = (
+        b"authorization",
+        b"bearer",
+        b"access_token",
+        b"refresh_token",
+        b"code_verifier",
+        b"client_secret",
+        b"http_headers",
+        b"bearer_token_env_var",
+        b"--debug",
+        b"/authorize?",
+        b"$(",
+        b"${",
+        b"`",
+    )
+    if any(value in lowered for value in forbidden):
+        raise InstallError(
+            "recovery_preimage_unsafe", "The recovery rollback input is unsafe."
+        )
+
+
+def _assert_nested_env_table(alias: str, segment: bytes) -> None:
+    header = f"[mcp_servers.{alias}.env]".encode("utf-8")
+    if segment.count(header) != 1 or re.search(rb"(?m)^[ \t]*env[ \t]*=", segment):
+        raise InstallError(
+            "recovery_preimage_invalid",
+            "The recovery runtime environment table is not exact.",
+        )
+
+
+def _validate_mcp_remote_alias(value: object) -> tuple[int, str, str]:
+    if not isinstance(value, Mapping):
+        raise InstallError(
+            "recovery_preimage_invalid", "The recovery runtime config is invalid."
+        )
+    required = {
+        "command",
+        "args",
+        "env",
+        "default_tools_approval_mode",
+        "startup_timeout_sec",
+    }
+    args = value.get("args")
+    env = value.get("env")
+    config_dir = env.get("MCP_REMOTE_CONFIG_DIR") if isinstance(env, Mapping) else None
+    if (
+        set(value) != required
+        or not isinstance(value.get("command"), str)
+        or not os.path.isabs(value["command"])
+        or os.path.normpath(value["command"]) != value["command"]
+        or not value["command"].endswith(MCP_REMOTE_COMMAND_SUFFIX)
+        or any(
+            character in value["command"]
+            for character in ("\x00", "\n", "\r", "`", "$", "~")
+        )
+        or not isinstance(args, list)
+        or len(args) != 6
+        or args[0] != LINEAR_MCP_ENDPOINT
+        or not isinstance(args[1], str)
+        or not args[1].isdigit()
+        or not 1024 <= int(args[1]) <= 65535
+        or args[2:] != ["--transport", "http-only", "--host", "127.0.0.1"]
+        or not isinstance(env, Mapping)
+        or set(env) != {"ARS_MCP_AUTH_MODE", "MCP_REMOTE_CONFIG_DIR"}
+        or env.get("ARS_MCP_AUTH_MODE") != "noninteractive"
+        or not isinstance(config_dir, str)
+        or not os.path.isabs(config_dir)
+        or os.path.normpath(config_dir) != config_dir
+        or any(
+            character in config_dir for character in ("\x00", "\n", "\r", "`", "$", "~")
+        )
+        or value.get("default_tools_approval_mode") != "writes"
+        or value.get("startup_timeout_sec") != 60.0
+    ):
+        raise InstallError(
+            "recovery_preimage_invalid", "The recovery runtime config is invalid."
+        )
+    return int(args[1]), config_dir, value["command"]
+
+
+def _paused_legacy_body(legacy: Mapping[str, Any]) -> bytes:
+    segment = legacy["config_segment"].encode("utf-8")
+    begin = (LEGACY_BLOCK_BEGIN + "\n").encode("utf-8")
+    end = (LEGACY_BLOCK_END + "\n").encode("utf-8")
+    if segment.count(begin) != 1 or segment.count(end) != 1:
+        raise InstallError(
+            "legacy_state_invalid", "The legacy managed config marker is invalid."
+        )
+    begin_index = segment.index(begin)
+    end_index = segment.index(end)
+    if (
+        begin_index > 1
+        or end_index <= begin_index
+        or end_index + len(end) != len(segment)
+    ):
+        raise InstallError(
+            "legacy_state_invalid", "The legacy managed config marker is invalid."
+        )
+    paused = segment[begin_index + len(begin) : end_index]
+    enabled = b"enabled = true\n"
+    expected = len(_parse_legacy_connections(legacy["connections"]))
+    if paused.count(enabled) != expected:
+        raise InstallError(
+            "legacy_state_invalid", "The legacy managed config segment is invalid."
+        )
+    return paused.replace(enabled, b"enabled = false\n")
+
+
+def _remove_ranges(data: bytes, ranges: list[tuple[int, int]]) -> bytes:
+    ordered = sorted(ranges)
+    if any(start < 0 or end <= start for start, end in ordered) or any(
+        ordered[index][1] > ordered[index + 1][0] for index in range(len(ordered) - 1)
+    ):
+        raise InstallError(
+            "recovery_preimage_invalid", "The recovery ownership ranges overlap."
+        )
+    pieces: list[bytes] = []
+    cursor = 0
+    for start, end in ordered:
+        pieces.append(data[cursor:start])
+        cursor = end
+    pieces.append(data[cursor:])
+    return b"".join(pieces)
+
+
+def _recovery_plan(
+    current: bytes,
+    parsed: Mapping[str, Any],
+    legacy: Mapping[str, Any],
+    aliases: tuple[str, str],
+) -> tuple[bytes, bytes, str]:
+    if parsed.get("mcp_oauth_credentials_store", _MISSING) is not _MISSING:
+        raise InstallError(
+            "recovery_preimage_invalid",
+            "The exact recovery preimage must not contain OAuth keyring state.",
+        )
+    begin_line = (LEGACY_BLOCK_BEGIN + "\n").encode("utf-8")
+    end_line = (LEGACY_BLOCK_END + "\n").encode("utf-8")
+    if current.count(begin_line) != 0 or current.count(end_line) != 1:
+        raise InstallError(
+            "recovery_preimage_invalid",
+            "The orphaned legacy marker shape is not exact.",
+        )
+    paused_legacy = _paused_legacy_body(legacy)
+    if current.count(paused_legacy) != 1:
+        raise InstallError(
+            "recovery_preimage_invalid", "The paused legacy residue is not exact."
+        )
+    paused_start = current.index(paused_legacy)
+    paused_range = (paused_start, paused_start + len(paused_legacy))
+    end_start = current.index(end_line)
+    end_range = (end_start, end_start + len(end_line))
+    if end_start <= paused_range[1]:
+        raise InstallError(
+            "recovery_preimage_invalid",
+            "The orphaned legacy end marker is not separated from paused canaries.",
+        )
+    servers = _mcp_servers(parsed)
+    ports_and_dirs = [
+        _validate_mcp_remote_alias(servers.get(alias)) for alias in aliases
+    ]
+    if (
+        len({port for port, _directory, _command in ports_and_dirs}) != 2
+        or len({directory for _port, directory, _command in ports_and_dirs}) != 2
+        or len({command for _port, _directory, command in ports_and_dirs}) != 1
+    ):
+        raise InstallError(
+            "recovery_preimage_invalid", "The recovery profiles are not isolated."
+        )
+    spans = _table_spans(current)
+    try:
+        alias_ranges = [spans[alias] for alias in aliases]
+    except KeyError as exc:
+        raise InstallError(
+            "recovery_preimage_invalid", "A recovery alias table is missing."
+        ) from exc
+    ordered_alias_ranges = sorted(alias_ranges)
+    if ordered_alias_ranges[0][1] != ordered_alias_ranges[1][0]:
+        raise InstallError(
+            "recovery_preimage_invalid",
+            "The recovery alias pair is not one contiguous owned segment.",
+        )
+    for alias, (start, finish) in zip(aliases, alias_ranges):
+        _assert_safe_rollback_segment(current[start:finish])
+        _assert_nested_env_table(alias, current[start:finish])
+    base_config = _remove_ranges(current, [paused_range, end_range, *alias_ranges])
+    base_parsed = _parse_config_bytes(base_config)
+    _assert_no_alias_conflict(base_parsed, aliases)
+    ownership, with_keyring = _keyring_plan(base_config, base_parsed)
+    if ownership != "managed":
+        raise InstallError(
+            "recovery_preimage_invalid", "The recovery keyring ownership is not exact."
+        )
+    native_segment = _managed_segment(with_keyring, _managed_block(aliases))
+    desired_config = with_keyring + native_segment
+    _parse_config_bytes(desired_config)
+    return desired_config, native_segment, ownership
+
+
 def _stage_skill(
     source: Path, destination: Path, marker: Mapping[str, Any]
 ) -> tuple[Path, Path]:
@@ -586,7 +977,12 @@ def _stage_skill(
     return staging_root, staged
 
 
-def _stage_state(destination: Path, marker: Mapping[str, Any]) -> tuple[Path, Path]:
+def _stage_state(
+    destination: Path,
+    marker: Mapping[str, Any],
+    *,
+    recovery_preimage: bytes | None = None,
+) -> tuple[Path, Path]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging_root = Path(
         tempfile.mkdtemp(prefix=".official-linear-state-", dir=destination.parent)
@@ -600,6 +996,18 @@ def _stage_state(destination: Path, marker: Mapping[str, Any]) -> tuple[Path, Pa
             json.dumps(marker, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         marker_path.chmod(MARKER_MODE)
+        if recovery_preimage is not None:
+            preimage_path = staged / RECOVERY_PREIMAGE_NAME
+            descriptor = os.open(
+                preimage_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                RECOVERY_PREIMAGE_MODE,
+            )
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(recovery_preimage)
+                handle.flush()
+                os.fsync(handle.fileno())
+            preimage_path.chmod(RECOVERY_PREIMAGE_MODE)
     except Exception:
         shutil.rmtree(staging_root, ignore_errors=True)
         raise
@@ -875,6 +1283,88 @@ def _migrate(args: argparse.Namespace) -> dict[str, Any]:
     return _result(mode="apply", status="staged", aliases=aliases)
 
 
+def _recover_migrate(args: argparse.Namespace) -> dict[str, Any]:
+    aliases = _parse_aliases(args.alias)
+    source = _source_skill_root()
+    skills_root = _skills_root(args.skills_root)
+    destination = skills_root / SKILL_NAME
+    state_path = _state_path(skills_root)
+    if _load_staged_state(state_path) is not None:
+        raise InstallError(
+            "migration_in_progress", "Finalize or restore the staged migration first."
+        )
+    current, mode, parsed, current_preexisted = _read_config(_config_path(args.config))
+    legacy_raw, legacy = _load_legacy(destination)
+    desired_config, native_segment, ownership = _recovery_plan(
+        current, parsed, legacy, aliases
+    )
+    preimage_hash = hashlib.sha256(current).hexdigest()
+    marker = _marker_payload(
+        source_hash=_tree_hash(source),
+        aliases=aliases,
+        native_segment=native_segment,
+        keyring_ownership=ownership,
+        config_preexisted=current_preexisted,
+        lifecycle="staged-v2",
+        legacy_marker_sha256=hashlib.sha256(legacy_raw).hexdigest(),
+        legacy_segment_sha256=hashlib.sha256(
+            legacy["config_segment"].encode("utf-8")
+        ).hexdigest(),
+        recovery_preimage_sha256=preimage_hash,
+        recovery_preimage_mode=mode,
+        recovery_native_sha256=hashlib.sha256(desired_config).hexdigest(),
+    )
+    actions = [
+        "stage-owner-only-byte-exact-recovery-copy",
+        "retire-exact-paused-v2-residue",
+        "retire-exact-mcp-remote-alias-pair",
+        "add-keyring-invariant",
+        "add-exact-native-connection-block",
+    ]
+    if not args.apply:
+        return _result(
+            mode="dry-run",
+            status="planned",
+            aliases=aliases,
+            actions=actions,
+            preimage_sha256=preimage_hash,
+        )
+    if args.expected_config_sha256 != preimage_hash:
+        raise InstallError(
+            "recovery_preimage_changed",
+            "The reviewed recovery preimage digest does not match current config.",
+        )
+    staging_root: Path | None = None
+    try:
+        staging_root, staged = _stage_state(
+            state_path, marker, recovery_preimage=current
+        )
+        _install_staged(staged, state_path)
+    except OSError as exc:
+        raise InstallError(
+            "state_apply_failed", "The recovery migration state could not be installed."
+        ) from exc
+    finally:
+        if staging_root is not None:
+            shutil.rmtree(staging_root, ignore_errors=True)
+    try:
+        _atomic_compare_and_write(
+            _config_path(args.config),
+            current,
+            mode,
+            desired_config,
+            mode,
+        )
+    except (InstallError, OSError) as exc:
+        shutil.rmtree(state_path, ignore_errors=True)
+        if isinstance(exc, InstallError):
+            raise
+        raise InstallError(
+            "config_apply_failed", "The recovery migration config could not be applied."
+        ) from exc
+    return _result(mode="apply", status="staged", aliases=aliases)
+
+
 def _config_without_native(
     current: bytes, marker: Mapping[str, Any]
 ) -> tuple[bytes, bytes, bytes]:
@@ -897,8 +1387,19 @@ def _restore(args: argparse.Namespace) -> dict[str, Any]:
     if staged is not None:
         _assert_native_config_exact(current, parsed, staged)
         _legacy_raw, legacy = _assert_legacy_authority(destination, staged)
-        _working, prefix, suffix = _config_without_native(current, staged)
-        desired_config = prefix + legacy["config_segment"].encode("utf-8") + suffix
+        recovery_preimage = staged.get("recovery_preimage")
+        if recovery_preimage is not None:
+            if hashlib.sha256(current).hexdigest() != staged["recovery_native_sha256"]:
+                raise InstallError(
+                    "managed_config_drift",
+                    "The recovery native config has drifted; refusing restore.",
+                )
+            desired_config = recovery_preimage
+            desired_mode = staged["recovery_preimage_mode"]
+        else:
+            _working, prefix, suffix = _config_without_native(current, staged)
+            desired_config = prefix + legacy["config_segment"].encode("utf-8") + suffix
+            desired_mode = mode
         _parse_config_bytes(desired_config)
         aliases = staged["normalized_aliases"]
         actions = [
@@ -912,12 +1413,33 @@ def _restore(args: argparse.Namespace) -> dict[str, Any]:
                 mode="dry-run", status="planned", aliases=aliases, actions=actions
             )
         removal = state_path.parent / f".official-linear-remove-{uuid.uuid4().hex}"
+        if recovery_preimage is not None:
+            try:
+                os.replace(state_path, removal)
+                _atomic_compare_and_write(
+                    _config_path(args.config),
+                    current,
+                    mode,
+                    desired_config,
+                    desired_mode,
+                )
+            except (InstallError, OSError) as exc:
+                if removal.exists() and not state_path.exists():
+                    os.replace(removal, state_path)
+                if isinstance(exc, InstallError):
+                    raise
+                raise InstallError(
+                    "restore_failed",
+                    "The recovery migration could not be restored atomically.",
+                ) from exc
+            shutil.rmtree(removal)
+            return _result(mode="apply", status="legacy-restored", aliases=aliases)
         try:
             os.replace(state_path, removal)
             _write_restored_config(
                 _config_path(args.config),
                 desired_config,
-                mode,
+                desired_mode,
                 should_exist=staged["config_preexisted"] or bool(desired_config),
             )
         except OSError as exc:
@@ -995,10 +1517,15 @@ def _finalize(args: argparse.Namespace) -> dict[str, Any]:
             "finalize_unavailable", "No exact staged v2 migration is available."
         )
     _assert_legacy_authority(destination, staged)
-    current, _mode, parsed, _current_preexisted = _read_config(
-        _config_path(args.config)
-    )
+    current, mode, parsed, _current_preexisted = _read_config(_config_path(args.config))
     _assert_native_config_exact(current, parsed, staged)
+    if staged.get("recovery_preimage") is not None and (
+        hashlib.sha256(current).hexdigest() != staged["recovery_native_sha256"]
+    ):
+        raise InstallError(
+            "managed_config_drift",
+            "The recovery native config has drifted; refusing finalization.",
+        )
     source_hash = _tree_hash(source)
     if staged["source_hash"] != source_hash:
         raise InstallError(
@@ -1026,24 +1553,38 @@ def _finalize(args: argparse.Namespace) -> dict[str, Any]:
     staging_root: Path | None = None
     legacy_backup: Path | None = None
     state_backup = state_path.parent / f".official-linear-state-{uuid.uuid4().hex}"
-    try:
-        staging_root, staged_skill = _stage_skill(source, destination, marker)
-        legacy_backup = _install_staged(staged_skill, destination)
-        os.replace(state_path, state_backup)
-    except OSError as exc:
+    recovery = staged.get("recovery_preimage") is not None
+    lock = (
+        _locked_config(_config_path(args.config), current, mode)
+        if recovery
+        else nullcontext(None)
+    )
+    with lock as config_descriptor:
+        try:
+            staging_root, staged_skill = _stage_skill(source, destination, marker)
+            legacy_backup = _install_staged(staged_skill, destination)
+            os.replace(state_path, state_backup)
+            if config_descriptor is not None:
+                _assert_locked_config_exact(
+                    _config_path(args.config), config_descriptor, current, mode
+                )
+        except (InstallError, OSError) as exc:
+            if legacy_backup is not None:
+                _restore_directory(destination, legacy_backup)
+            if state_backup.exists() and not state_path.exists():
+                os.replace(state_backup, state_path)
+            if isinstance(exc, InstallError):
+                raise
+            raise InstallError(
+                "finalize_failed",
+                "The staged migration could not be finalized atomically.",
+            ) from exc
+        finally:
+            if staging_root is not None:
+                shutil.rmtree(staging_root, ignore_errors=True)
         if legacy_backup is not None:
-            _restore_directory(destination, legacy_backup)
-        if state_backup.exists() and not state_path.exists():
-            os.replace(state_backup, state_path)
-        raise InstallError(
-            "finalize_failed", "The staged migration could not be finalized atomically."
-        ) from exc
-    finally:
-        if staging_root is not None:
-            shutil.rmtree(staging_root, ignore_errors=True)
-    if legacy_backup is not None:
-        shutil.rmtree(legacy_backup)
-    shutil.rmtree(state_backup)
+            shutil.rmtree(legacy_backup)
+        shutil.rmtree(state_backup)
     return _result(mode="apply", status="finalized", aliases=aliases)
 
 
@@ -1052,17 +1593,22 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     install = subparsers.add_parser("install")
     migrate = subparsers.add_parser("migrate")
+    recover_migrate = subparsers.add_parser("recover-migrate")
     restore = subparsers.add_parser("restore")
     rollback = subparsers.add_parser("rollback")
     finalize = subparsers.add_parser("finalize")
-    for subparser in (install, migrate):
+    for subparser in (install, migrate, recover_migrate):
         subparser.add_argument(
             "--alias",
             action="append",
             required=True,
             help="One final lowercase Codex MCP alias; supply exactly twice.",
         )
-    for subparser in (install, migrate, restore, rollback, finalize):
+    recover_migrate.add_argument(
+        "--expected-config-sha256",
+        help="Required on apply; must match the reviewed dry-run preimage digest.",
+    )
+    for subparser in (install, migrate, recover_migrate, restore, rollback, finalize):
         subparser.add_argument("--skills-root")
         subparser.add_argument("--config")
         subparser.add_argument("--apply", action="store_true")
@@ -1076,6 +1622,8 @@ def main(argv: list[str] | None = None) -> int:
             payload = _install(args)
         elif args.command == "migrate":
             payload = _migrate(args)
+        elif args.command == "recover-migrate":
+            payload = _recover_migrate(args)
         elif args.command in {"restore", "rollback"}:
             payload = _restore(args)
         else:

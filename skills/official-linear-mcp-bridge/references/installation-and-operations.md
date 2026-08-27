@@ -62,6 +62,80 @@ After approval, add `--apply`. Migration atomically replaces the exact v2 config
 
 No OAuth login, Linear request, process action, or Codex reload occurs inside migration.
 
+## Exact composite recovery migration
+
+`recover-migrate` is a narrow repair transition, not a general drift override. It
+accepts only an unchanged installer-managed v2 skill and marker together with
+this exact historical composite config preimage:
+
+- the v2 begin marker is absent, its exact contiguous canary tables are paused,
+  and exactly one orphan end-marker line follows unrelated preserved tables;
+- exactly two explicitly requested final aliases form a contiguous pair of
+  effective-enabled tables using an absolute command ending in the pinned
+  `mcp-remote/ars-operandi-1.0.0/node_modules/.bin/mcp-remote` runtime, the
+  official endpoint, distinct fixed callback ports, `http-only` transport,
+  loopback host, nested environment tables with noninteractive auth and distinct
+  absolute `MCP_REMOTE_CONFIG_DIR` values, no headers or secret-bearing fields,
+  and the documented approval/timeout policy;
+- no native staged state or OAuth-store setting already exists.
+
+Plan without writes:
+
+```bash
+python3 skills/official-linear-mcp-bridge/scripts/install_official_linear_mcp_bridge.py recover-migrate \
+  --alias linear-example-a \
+  --alias linear-example-b
+```
+
+The sanitized plan returns a `preimage_sha256`. After reviewing the exact local
+backup/config operation, bind apply to that digest:
+
+```bash
+python3 skills/official-linear-mcp-bridge/scripts/install_official_linear_mcp_bridge.py recover-migrate \
+  --alias linear-example-a \
+  --alias linear-example-b \
+  --expected-config-sha256 <reviewed-64-hex-digest> \
+  --apply
+```
+
+Apply atomically installs the same native block and ordinary staged-v3 metadata
+used by exact migration. It additionally retains one byte-exact rollback copy
+as a regular `0600` file inside the existing `0700` staged-state directory. The
+copy may contain the prior local command arguments and environment paths, is
+never printed, and exists only until pre-restart `restore` or post-smoke
+`finalize`. Recovery does not create another runtime, credential store, or
+persistent lifecycle surface.
+
+Because recovery must restore the entire proven composite preimage exactly,
+restore and finalize refuse config-byte drift detected within the documented
+guarantee before their final comparison. Restore reinstates the prior bytes and
+file mode; finalize removes the private rollback copy together with the staged
+state. A mismatched digest, altered marker, unexpected alias field, non-isolated
+profile, unsafe field, symlink, mode drift, or filesystem failure fails closed.
+
+Recovery apply and restore take an exclusive advisory lock on the current config
+inode and compare inode, bytes, and mode again inside the atomic replacement
+primitive. Finalize holds the same lock across the skill/state transition and
+revalidates before deleting rollback authority. These checks fail closed for
+cooperating writers and drift observable before the final comparison, preserving
+the observed concurrent bytes and staged rollback state. Advisory `flock` is not
+enforcement against a non-cooperating writer, and a residual comparison-to-replace
+race remains; no persistent lock file, daemon, or coordination store is created.
+
+Before `recover-migrate --apply`, recovery `restore --apply`, or recovery
+`finalize --apply`, the operator must close Codex Settings and every editor or
+installer that can write `config.toml`, then avoid manual config writes until the
+command returns. Immediately afterward, read back the config mode and digest,
+expected native-or-restored alias state, staged rollback-state presence or
+absence, and installer marker lifecycle before continuing to OAuth, restart, or
+another lifecycle step. An unexpected read-back fails closed and requires
+stopping further mutation and preserving whatever config, state, and evidence
+still exists for human review. A failed-operation mismatch restores staged
+rollback authority when the command reports that outcome; an unexpected
+read-back after a reported successful restore or finalize must not assume that
+rollback authority still exists. Follow the documented post-finalization
+recovery boundary and obtain a reviewed recovery plan before any further change.
+
 ## Human activation and evidence gates
 
 For a staged v2 migration, keep the currently running Codex app open on its already-loaded v2 registry throughout pre-restart qualification:
@@ -110,4 +184,7 @@ After finalization, `restore` removes the exact native block, the installer-owne
 - A config failure restores the previous skill/state and config when necessary.
 - Alias-set changes, unmanaged alias conflicts, keyring conflicts, marker changes, managed config changes, staged-state changes, and legacy-tree changes fail closed.
 - JSON success and error output excludes raw aliases, config contents, legacy references, accounts, exception details, and provider output.
+- Composite recovery output additionally excludes prior command arguments,
+  environment paths, and rollback-copy contents; apply requires the reviewed
+  preimage digest and removes its owner-only rollback copy at restore/finalize.
 - The installer contains no network, browser, OAuth-login, subprocess, process-termination, or restart implementation.
